@@ -25,7 +25,7 @@ from .db import (
 )
 
 
-SUCCESS_STATUSES = {"created", "updated", "up_to_date", "no_new_data", "suspended"}
+SUCCESS_STATUSES = {"created", "updated", "up_to_date", "no_new_data", "suspended", "repaired"}
 UPSERT_BATCH_SIZE = 1000
 
 
@@ -35,6 +35,8 @@ def _upsert_daily_bars(
     adjust: str,
     bars: pd.DataFrame,
     name: str | None = None,
+    data_source: str = "unknown",
+    quality_flags: list[str] | None = None,
 ) -> int:
     if bars.empty:
         return 0
@@ -63,7 +65,8 @@ def _upsert_daily_bars(
                 "volume": _to_int(row.get("volume")),
                 "amount": _to_float(row.get("amount")),
                 "turnover": _to_float(row.get("turnover")),
-                "data_source": "akshare_web",
+                "data_source": _short_text(data_source, 32) or "unknown",
+                "quality_flags": quality_flags or [],
             }
         )
     if not records:
@@ -81,6 +84,7 @@ def _upsert_daily_bars(
             amount=func.coalesce(statement.inserted.amount, DailyBar.amount),
             turnover=func.coalesce(statement.inserted.turnover, DailyBar.turnover),
             data_source=statement.inserted.data_source,
+            quality_flags=statement.inserted.quality_flags,
             updated_at=func.now(),
         )
         session.execute(statement)
@@ -122,6 +126,8 @@ def import_daily_store_to_db(
                     adjust=adjust,
                     bars=bars,
                     name=stock_names.get(symbol),
+                    data_source="local_csv",
+                    quality_flags=[],
                 )
                 imported_files += 1
                 session.commit()
@@ -214,6 +220,8 @@ def run_daily_update_and_ingest(
                             adjust="qfq",
                             bars=bars,
                             name=result.get("name"),
+                            data_source=result.get("data_source") or "unknown",
+                            quality_flags=result.get("quality_flags") or [],
                         )
                         instrument_id = _get_or_create_instrument_id(
                             session=session,
@@ -239,6 +247,111 @@ def run_daily_update_and_ingest(
                 result_df=result_df,
                 message=(
                     f"processed={len(result_df)}, upserted_rows={upserted_rows}, "
+                    f"effective_end_date={effective_end_date}"
+                ),
+            )
+    except Exception as exc:
+        _finish_sync_run(
+            database_url=database_url,
+            run_id=run_id,
+            status="failed",
+            message=_short_text(str(exc), 2048),
+        )
+        raise
+
+    status_counts = result_df["status"].value_counts().to_dict() if not result_df.empty else {}
+    return {
+        "processed": int(len(result_df)),
+        "status_counts": status_counts,
+        "database_upsert_rows": int(upserted_rows),
+        "database_url": safe_database_url(database_url),
+    }
+
+
+def run_daily_quality_repair(
+    start_date: str,
+    end_date: str,
+    workers: int = 4,
+    max_stocks: int = 0,
+    database_url: str = DEFAULT_DATABASE_URL,
+    cache_dir: Path | None = None,
+) -> dict:
+    init_db(database_url=database_url)
+    cache_dir = cache_dir or Path("data") / "cache"
+    client = MarketDataClient(cache_dir=cache_dir, use_cache=True)
+    run_id = _create_sync_run(
+        database_url=database_url,
+        run_type="repair_daily_quality",
+        start_date=start_date,
+        end_date=end_date,
+        params={
+            "workers": workers,
+            "max_stocks": max_stocks,
+            "cache_dir": str(cache_dir),
+        },
+    )
+
+    try:
+        effective_end_date = client.resolve_effective_end_date(end_date)
+        upserted_rows = 0
+        rows: list[dict[str, Any]] = []
+        with session_scope(database_url=database_url) as session:
+            worklist = _build_daily_quality_repair_worklist(
+                session=session,
+                start_date=start_date,
+                end_date=effective_end_date,
+                max_stocks=max_stocks,
+                adjust="qfq",
+            )
+            symbol_to_instrument_id: dict[str, int] = {}
+            if not worklist.empty:
+                if workers <= 1:
+                    fetch_results = [
+                        _fetch_daily_repair_for_db(client=client, row=row, end_date=effective_end_date, adjust="qfq")
+                        for _, row in worklist.iterrows()
+                    ]
+                else:
+                    with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
+                        futures = [
+                            executor.submit(_fetch_daily_repair_for_db, client, row, effective_end_date, "qfq")
+                            for _, row in worklist.iterrows()
+                        ]
+                        fetch_results = [future.result() for future in as_completed(futures)]
+
+                for result, bars in fetch_results:
+                    if bars is not None and not bars.empty:
+                        upserted_rows += _upsert_daily_bars(
+                            session=session,
+                            symbol=result["symbol"],
+                            adjust="qfq",
+                            bars=bars,
+                            name=result.get("name"),
+                            data_source=result.get("data_source") or "unknown",
+                            quality_flags=result.get("quality_flags") or [],
+                        )
+                        instrument_id = _get_or_create_instrument_id(
+                            session=session,
+                            symbol=result["symbol"],
+                            name=result.get("name"),
+                        )
+                        symbol_to_instrument_id[result["symbol"]] = instrument_id
+                        session.commit()
+                    rows.append(result)
+
+            result_df = pd.DataFrame(rows)
+            _record_sync_run_items(
+                session=session,
+                run_id=run_id,
+                result_df=result_df,
+                symbol_to_instrument_id=symbol_to_instrument_id,
+            )
+            _finish_sync_run_in_session(
+                session=session,
+                run_id=run_id,
+                status="completed",
+                result_df=result_df,
+                message=(
+                    f"repair_candidates={len(result_df)}, upserted_rows={upserted_rows}, "
                     f"effective_end_date={effective_end_date}"
                 ),
             )
@@ -480,6 +593,66 @@ def _build_daily_db_worklist(
     return worklist.reset_index(drop=True)
 
 
+def _build_daily_quality_repair_worklist(
+    session,
+    start_date: str,
+    end_date: str,
+    max_stocks: int = 0,
+    adjust: str = "qfq",
+) -> pd.DataFrame:
+    start_ts = pd.Timestamp(start_date).date()
+    end_ts = pd.Timestamp(end_date).date()
+    bad_condition = or_(
+        DailyBar.open.is_(None),
+        DailyBar.high.is_(None),
+        DailyBar.low.is_(None),
+        DailyBar.close.is_(None),
+        DailyBar.volume.is_(None),
+        DailyBar.amount.is_(None),
+        DailyBar.high < DailyBar.low,
+        DailyBar.high < DailyBar.open,
+        DailyBar.high < DailyBar.close,
+        DailyBar.low > DailyBar.open,
+        DailyBar.low > DailyBar.close,
+    )
+    rows = session.execute(
+        select(
+            Instrument.symbol,
+            Instrument.name,
+            func.min(DailyBar.trade_date),
+            func.max(DailyBar.trade_date),
+            func.count(DailyBar.id),
+        )
+        .join(DailyBar, DailyBar.instrument_id == Instrument.id)
+        .where(
+            DailyBar.adjust_type == adjust,
+            DailyBar.trade_date >= start_ts,
+            DailyBar.trade_date <= end_ts,
+            bad_condition,
+        )
+        .group_by(Instrument.symbol, Instrument.name)
+        .order_by(func.min(DailyBar.trade_date), Instrument.symbol)
+        .limit(max_stocks if max_stocks and max_stocks > 0 else None)
+    ).all()
+
+    work_rows = []
+    for symbol, name, first_bad_date, latest_bad_date, bad_rows in rows:
+        first_bad = pd.Timestamp(first_bad_date).strftime("%Y-%m-%d")
+        latest_bad = pd.Timestamp(latest_bad_date).strftime("%Y-%m-%d")
+        work_rows.append(
+            {
+                "symbol": _normalize_symbol(symbol),
+                "name": _clean_text(name) or _normalize_symbol(symbol),
+                "fetch_start": first_bad,
+                "latest_db_date": "",
+                "download_reason": "quality_repair",
+                "existing_rows": int(bad_rows),
+                "latest_bad_date": latest_bad,
+            }
+        )
+    return pd.DataFrame(work_rows)
+
+
 def _fetch_daily_update_for_db(
     client: MarketDataClient,
     row,
@@ -500,10 +673,12 @@ def _fetch_daily_update_for_db(
         "suspension_reason": "",
         "expected_resume_date": "",
         "error": "",
+        "data_source": "",
+        "quality_flags": [],
     }
 
     try:
-        bars = client.get_daily_bars(
+        provider_result = client.get_daily_bars_result(
             symbol=symbol,
             start_date=fetch_start,
             end_date=end_date,
@@ -511,6 +686,9 @@ def _fetch_daily_update_for_db(
             persist_cache=False,
             raise_on_error=True,
         )
+        bars = provider_result.data
+        base_result["data_source"] = provider_result.source
+        base_result["quality_flags"] = provider_result.quality_flags
     except Exception as exc:
         suspended_info = client.get_suspension_info(symbol=symbol, date=end_date)
         if suspended_info is not None:
@@ -534,6 +712,8 @@ def _fetch_daily_update_for_db(
                 "total_rows": existing_rows,
                 "latest_date": before_latest_date,
                 "error": f"{type(exc).__name__}: {exc}",
+                "data_source": base_result.get("data_source", ""),
+                "quality_flags": base_result.get("quality_flags", []),
             },
             None,
         )
@@ -589,6 +769,86 @@ def _fetch_daily_update_for_db(
             "status": "updated" if existing_rows else "created",
             "rows_added": int(len(prepared)),
             "total_rows": int(existing_rows + len(prepared)),
+            "latest_date": latest_date,
+            "data_source": base_result.get("data_source", ""),
+            "quality_flags": base_result.get("quality_flags", []),
+        },
+        prepared,
+    )
+
+
+def _fetch_daily_repair_for_db(
+    client: MarketDataClient,
+    row,
+    end_date: str,
+    adjust: str = "qfq",
+) -> tuple[dict[str, Any], pd.DataFrame | None]:
+    symbol = _normalize_symbol(row["symbol"])
+    name = _clean_text(row.get("name")) or symbol
+    fetch_start = _clean_text(row.get("fetch_start"))
+    existing_rows = _to_int(row.get("existing_rows")) or 0
+    base_result = {
+        "symbol": symbol,
+        "name": name,
+        "planned_start_date": fetch_start,
+        "before_latest_date": "",
+        "download_reason": _clean_text(row.get("download_reason")) or "quality_repair",
+        "suspension_reason": "",
+        "expected_resume_date": "",
+        "error": "",
+        "data_source": "",
+        "quality_flags": [],
+    }
+
+    try:
+        provider_result = client.get_daily_bars_result(
+            symbol=symbol,
+            start_date=fetch_start,
+            end_date=end_date,
+            adjust=adjust,
+            persist_cache=False,
+            raise_on_error=True,
+        )
+        bars = provider_result.data
+        base_result["data_source"] = provider_result.source
+        base_result["quality_flags"] = provider_result.quality_flags
+    except Exception as exc:
+        return (
+            {
+                **base_result,
+                "status": "failed",
+                "rows_added": 0,
+                "total_rows": existing_rows,
+                "latest_date": "",
+                "error": f"{type(exc).__name__}: {exc}",
+            },
+            None,
+        )
+
+    if bars.empty:
+        return (
+            {
+                **base_result,
+                "status": "failed",
+                "rows_added": 0,
+                "total_rows": existing_rows,
+                "latest_date": "",
+                "error": provider_result.error or "empty provider result",
+            },
+            None,
+        )
+
+    prepared = bars.copy()
+    prepared["date"] = pd.to_datetime(prepared["date"], errors="coerce")
+    prepared = prepared.dropna(subset=["date"]).drop_duplicates(subset=["date"], keep="last")
+    prepared = prepared.sort_values("date").reset_index(drop=True)
+    latest_date = pd.Timestamp(prepared["date"].max()).strftime("%Y-%m-%d")
+    return (
+        {
+            **base_result,
+            "status": "repaired",
+            "rows_added": int(len(prepared)),
+            "total_rows": existing_rows,
             "latest_date": latest_date,
         },
         prepared,
@@ -846,6 +1106,8 @@ def _record_sync_run_items(
                 rows_added=_to_int(row.get("rows_added")) or 0,
                 total_rows=_to_int(row.get("total_rows")) or 0,
                 download_reason=_short_text(_clean_text(row.get("download_reason")), 32),
+                data_source=_short_text(_clean_text(row.get("data_source")), 32),
+                quality_flags=_normalize_quality_flags(row.get("quality_flags")),
                 error_message=_clean_text(row.get("error")),
                 suspension_reason=_short_text(_clean_text(row.get("suspension_reason")), 255),
                 expected_resume_date=_parse_date(row.get("expected_resume_date")),
@@ -959,6 +1221,21 @@ def _short_text(value: str | None, max_length: int) -> str | None:
         return None
     text = str(value)
     return text[:max_length]
+
+
+def _normalize_quality_flags(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item)]
+    if isinstance(value, (tuple, set)):
+        return [str(item) for item in value if str(item)]
+    if pd.isna(value):
+        return []
+    text = str(value).strip()
+    if not text:
+        return []
+    return [part.strip() for part in text.split("|") if part.strip()]
 
 
 def _infer_market(symbol: str) -> str:

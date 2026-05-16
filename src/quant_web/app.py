@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import json
+import os
+import socket
+import sys
+import threading
+import time
+from datetime import datetime, timedelta, timezone
 from os import getenv
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
 
 from fastapi import FastAPI, HTTPException, Query
@@ -16,6 +22,7 @@ from .db import DEFAULT_DATABASE_URL, init_db, safe_database_url
 from .service import (
     get_overview,
     get_stock_bars,
+    run_daily_quality_repair,
     run_daily_update_and_ingest,
     run_screen,
     search_stocks,
@@ -23,9 +30,17 @@ from .service import (
 
 
 class UpdateRequest(BaseModel):
-    end_date: str
-    start_date: str = "2010-01-01"
+    end_date: str = ""
+    backfill_start_date: str = "2010-01-01"
+    start_date: str | None = None
     workers: int = Field(default=8, ge=1, le=32)
+    max_stocks: int = Field(default=0, ge=0)
+
+
+class RepairRecentRequest(BaseModel):
+    end_date: str = ""
+    lookback_days: int = Field(default=10, ge=1, le=120)
+    workers: int = Field(default=4, ge=1, le=32)
     max_stocks: int = Field(default=0, ge=0)
 
 
@@ -48,12 +63,18 @@ class ReAgentChatRequest(BaseModel):
     messages: list[ReAgentMessage] = Field(default_factory=list)
 
 
+_RESTART_LOCK = threading.Lock()
+_RESTART_SCHEDULED = False
+
+
 def create_app(database_url: str = DEFAULT_DATABASE_URL) -> FastAPI:
     init_db(database_url=database_url)
     app = FastAPI(title="Quant Service", version="0.1.0")
     app.state.database_url = database_url
-    app.state.re_agent_base_url = getenv("RE_AGENT_BASE_URL", "")
-    app.state.re_agent_chat_path = getenv("RE_AGENT_CHAT_PATH", "/chat")
+    app.state.re_agent_base_url = getenv("RE_AGENT_BASE_URL", "http://127.0.0.1:8010")
+    app.state.re_agent_chat_path = getenv("RE_AGENT_CHAT_PATH", "/research/single-symbol")
+    app.state.started_at = datetime.now(timezone.utc)
+    app.state.started_monotonic = time.monotonic()
 
     @app.get("/api/health")
     def health() -> dict:
@@ -62,6 +83,20 @@ def create_app(database_url: str = DEFAULT_DATABASE_URL) -> FastAPI:
     @app.get("/api/overview")
     def overview() -> dict:
         return get_overview(database_url=app.state.database_url)
+
+    @app.get("/api/services/status")
+    def services_status() -> dict:
+        return _get_services_status(app)
+
+    @app.post("/api/services/quant/restart")
+    def restart_quant() -> dict:
+        _schedule_self_restart()
+        return {
+            "ok": True,
+            "service": "quant",
+            "status": "restarting",
+            "message": "quant service restart has been scheduled.",
+        }
 
     @app.get("/api/stocks/search")
     def stocks_search(
@@ -85,14 +120,33 @@ def create_app(database_url: str = DEFAULT_DATABASE_URL) -> FastAPI:
 
     @app.post("/api/tasks/update-daily")
     def update_daily(payload: UpdateRequest) -> dict:
+        end_date = payload.end_date or datetime.now().date().isoformat()
+        backfill_start_date = payload.start_date or payload.backfill_start_date or "2010-01-01"
         return run_daily_update_and_ingest(
-            end_date=payload.end_date,
-            start_date=payload.start_date,
+            end_date=end_date,
+            start_date=backfill_start_date,
             workers=payload.workers,
             max_stocks=payload.max_stocks,
             database_url=app.state.database_url,
             cache_dir=Path("data") / "cache",
         )
+
+    @app.post("/api/tasks/repair-daily-recent")
+    def repair_daily_recent(payload: RepairRecentRequest) -> dict:
+        end_date = datetime.fromisoformat(payload.end_date).date() if payload.end_date else datetime.now().date()
+        start_date = end_date - timedelta(days=max(payload.lookback_days * 2, payload.lookback_days))
+        result = run_daily_quality_repair(
+            start_date=start_date.isoformat(),
+            end_date=end_date.isoformat(),
+            workers=payload.workers,
+            max_stocks=payload.max_stocks,
+            database_url=app.state.database_url,
+            cache_dir=Path("data") / "cache",
+        )
+        result["repair_start_date"] = start_date.isoformat()
+        result["repair_end_date"] = end_date.isoformat()
+        result["lookback_days"] = payload.lookback_days
+        return result
 
     @app.post("/api/tasks/screen")
     def screen(payload: ScreenRequest) -> dict:
@@ -110,6 +164,7 @@ def create_app(database_url: str = DEFAULT_DATABASE_URL) -> FastAPI:
             payload=payload,
             base_url=app.state.re_agent_base_url,
             chat_path=app.state.re_agent_chat_path,
+            database_url=app.state.database_url,
         )
 
     @app.get("/", response_class=HTMLResponse)
@@ -321,6 +376,58 @@ def create_app(database_url: str = DEFAULT_DATABASE_URL) -> FastAPI:
       color: var(--muted);
       font-size: 13px;
     }
+    .service-list {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 12px;
+    }
+    .service-item {
+      border: 1px solid rgba(35, 28, 22, 0.1);
+      border-radius: 12px;
+      background: rgba(255,255,255,0.48);
+      padding: 12px;
+    }
+    .service-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 8px;
+    }
+    .service-name {
+      font-weight: 700;
+      font-size: 16px;
+    }
+    .status-pill {
+      border-radius: 999px;
+      padding: 4px 9px;
+      font-size: 12px;
+      font-weight: 700;
+      background: rgba(106,91,77,0.14);
+      color: var(--muted);
+      white-space: nowrap;
+    }
+    .status-pill.ok {
+      background: rgba(31,108,92,0.14);
+      color: var(--accent-2);
+    }
+    .status-pill.bad {
+      background: rgba(176,74,47,0.14);
+      color: var(--accent);
+    }
+    .service-meta {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.6;
+      min-height: 42px;
+    }
+    .service-actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-top: 10px;
+    }
+    .service-actions button { margin-top: 0; }
     @media (max-width: 760px) {
       .quote-toolbar { grid-template-columns: 1fr; }
       .agent-panel { grid-template-columns: 1fr; }
@@ -338,6 +445,17 @@ def create_app(database_url: str = DEFAULT_DATABASE_URL) -> FastAPI:
     </div>
 
     <div class="grid">
+      <div class="card wide">
+        <h2>服务状态</h2>
+        <div id="serviceStatus" class="service-list"></div>
+        <div class="service-actions">
+          <button id="serviceRefreshButton" class="secondary" onclick="loadServiceStatus()">刷新状态</button>
+          <button id="quantRestartButton" onclick="restartQuantService()">重启 quant</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="grid">
       <div class="card">
         <h2>数据库概览</h2>
         <div class="stat" id="totalRows">-</div>
@@ -347,13 +465,14 @@ def create_app(database_url: str = DEFAULT_DATABASE_URL) -> FastAPI:
 
       <div class="card">
         <h2>增量同步日线</h2>
-        <label>结束日期</label>
-        <input id="updateEndDate" value="" />
-        <label>起始日期</label>
-        <input id="updateStartDate" value="2010-01-01" />
         <label>线程数</label>
         <input id="updateWorkers" value="8" />
+        <label>最大股票数</label>
+        <input id="updateMaxStocks" value="0" />
         <button id="updateButton" onclick="runUpdate()">同步到最新</button>
+        <label>修复最近 N 日</label>
+        <input id="repairLookbackDays" value="10" />
+        <button id="repairRecentButton" class="secondary" onclick="runRecentRepair()">修复最近日线</button>
       </div>
 
       <div class="card">
@@ -435,7 +554,6 @@ def create_app(database_url: str = DEFAULT_DATABASE_URL) -> FastAPI:
     }
 
     const today = formatLocalDate();
-    document.getElementById("updateEndDate").value = today;
     document.getElementById("screenTradeDate").value = today;
     let agentMessages = [];
     let agentConversationId = null;
@@ -489,6 +607,88 @@ def create_app(database_url: str = DEFAULT_DATABASE_URL) -> FastAPI:
       }
     }
 
+    function formatUptime(seconds) {
+      if (!Number.isFinite(seconds)) return "-";
+      const total = Math.max(0, Math.floor(seconds));
+      const hours = Math.floor(total / 3600);
+      const minutes = Math.floor((total % 3600) / 60);
+      if (hours) return `${hours} 小时 ${minutes} 分钟`;
+      if (minutes) return `${minutes} 分钟`;
+      return `${total} 秒`;
+    }
+
+    function renderServiceStatus(data) {
+      const root = document.getElementById("serviceStatus");
+      const quant = data.quant || {};
+      const reAgent = data.re_agent || {};
+      const items = [
+        {
+          name: "quant",
+          status: quant.status,
+          pill: quant.status === "running" ? "运行中" : "异常",
+          meta: [
+            `PID ${quant.pid || "-"}`,
+            `已运行 ${formatUptime(quant.uptime_seconds)}`,
+            `页面服务 ${quant.start_supported ? "可启动" : "需外部启动"}`
+          ]
+        },
+        {
+          name: "re_agent",
+          status: reAgent.status,
+          pill: reAgent.status === "running" ? "运行中" : "未连接",
+          meta: [
+            reAgent.base_url || "-",
+            reAgent.error || `端口 ${reAgent.port || "-"}`
+          ]
+        }
+      ];
+      root.innerHTML = items.map(item => {
+        const cls = item.status === "running" ? "ok" : "bad";
+        return `<div class="service-item">
+          <div class="service-head">
+            <div class="service-name">${escapeHtml(item.name)}</div>
+            <div class="status-pill ${cls}">${escapeHtml(item.pill)}</div>
+          </div>
+          <div class="service-meta">${item.meta.map(line => `<div>${escapeHtml(line)}</div>`).join("")}</div>
+        </div>`;
+      }).join("");
+    }
+
+    async function loadServiceStatus() {
+      await withButton("serviceRefreshButton", "刷新中...", "service_status", async () => {
+        const data = await api("/api/services/status");
+        renderServiceStatus(data);
+        showResult(data);
+      });
+    }
+
+    async function restartQuantService() {
+      if (!confirm("确认重启 quant 服务？页面会短暂断开。")) {
+        return;
+      }
+      await withButton("quantRestartButton", "重启中...", "quant_restart", async () => {
+        const data = await api("/api/services/quant/restart", "POST", {});
+        showResult(data);
+        document.getElementById("serviceStatus").innerHTML = `<div class="service-item"><div class="service-head"><div class="service-name">quant</div><div class="status-pill">重启中</div></div><div class="service-meta">等待服务重新可用...</div></div>`;
+        setTimeout(waitForQuantService, 1400);
+      });
+    }
+
+    async function waitForQuantService(attempt = 1) {
+      try {
+        const data = await api("/api/services/status");
+        renderServiceStatus(data);
+        showResult({ok: true, action: "quant_restart", status: "ready", attempts: attempt});
+        await loadOverview();
+      } catch (error) {
+        if (attempt < 20) {
+          setTimeout(() => waitForQuantService(attempt + 1), 1000);
+        } else {
+          showError("quant_restart", error);
+        }
+      }
+    }
+
     async function loadOverview() {
       await withButton("overviewButton", "刷新中...", "loadOverview", async () => {
         const data = await api("/api/overview");
@@ -505,10 +705,20 @@ def create_app(database_url: str = DEFAULT_DATABASE_URL) -> FastAPI:
     async function runUpdate() {
       await withButton("updateButton", "同步中...", "update_daily", async () => {
         const data = await api("/api/tasks/update-daily", "POST", {
-          end_date: document.getElementById("updateEndDate").value,
-          start_date: document.getElementById("updateStartDate").value,
           workers: Number(document.getElementById("updateWorkers").value || 8),
-          max_stocks: 0
+          max_stocks: Number(document.getElementById("updateMaxStocks").value || 0)
+        });
+        showResult(data);
+        await loadOverview();
+      });
+    }
+
+    async function runRecentRepair() {
+      await withButton("repairRecentButton", "修复中...", "repair_daily_recent", async () => {
+        const data = await api("/api/tasks/repair-daily-recent", "POST", {
+          lookback_days: Number(document.getElementById("repairLookbackDays").value || 10),
+          workers: Number(document.getElementById("updateWorkers").value || 4),
+          max_stocks: Number(document.getElementById("updateMaxStocks").value || 0)
         });
         showResult(data);
         await loadOverview();
@@ -803,6 +1013,7 @@ def create_app(database_url: str = DEFAULT_DATABASE_URL) -> FastAPI:
     });
 
     renderAgentThread();
+    loadServiceStatus().catch(() => {});
     loadOverview();
     loadStockQuote("000001").catch(() => {});
   </script>
@@ -813,7 +1024,74 @@ def create_app(database_url: str = DEFAULT_DATABASE_URL) -> FastAPI:
     return app
 
 
-def _call_re_agent_chat(payload: ReAgentChatRequest, base_url: str, chat_path: str) -> dict:
+def _get_services_status(app: FastAPI) -> dict:
+    re_agent = _probe_tcp_service(app.state.re_agent_base_url)
+    return {
+        "quant": {
+            "status": "running",
+            "pid": os.getpid(),
+            "started_at": app.state.started_at.isoformat(),
+            "uptime_seconds": round(time.monotonic() - app.state.started_monotonic, 1),
+            "restart_supported": True,
+            "start_supported": False,
+        },
+        "re_agent": re_agent,
+    }
+
+
+def _probe_tcp_service(base_url: str) -> dict:
+    parsed = urlparse(base_url)
+    host = parsed.hostname
+    port = parsed.port
+    if not host:
+        return {
+            "status": "unknown",
+            "base_url": base_url,
+            "error": "base URL is not configured.",
+        }
+    if port is None:
+        port = 443 if parsed.scheme == "https" else 80
+
+    try:
+        with socket.create_connection((host, port), timeout=0.8):
+            pass
+    except OSError as exc:
+        return {
+            "status": "down",
+            "base_url": base_url,
+            "host": host,
+            "port": port,
+            "error": str(exc),
+        }
+    return {
+        "status": "running",
+        "base_url": base_url,
+        "host": host,
+        "port": port,
+    }
+
+
+def _schedule_self_restart() -> None:
+    global _RESTART_SCHEDULED
+    with _RESTART_LOCK:
+        if _RESTART_SCHEDULED:
+            return
+        _RESTART_SCHEDULED = True
+
+    def restart() -> None:
+        time.sleep(0.8)
+        os.execv(sys.executable, [sys.executable, *sys.argv])
+
+    thread = threading.Thread(target=restart, name="quant-self-restart", daemon=True)
+    thread.start()
+
+
+def _call_re_agent_chat(
+    payload: ReAgentChatRequest,
+    base_url: str,
+    chat_path: str,
+    database_url: str,
+) -> dict:
     if not base_url:
         raise HTTPException(
             status_code=503,
@@ -821,12 +1099,10 @@ def _call_re_agent_chat(payload: ReAgentChatRequest, base_url: str, chat_path: s
         )
 
     endpoint = urljoin(base_url.rstrip("/") + "/", chat_path.lstrip("/"))
+    symbol = _resolve_re_agent_symbol(payload.stock, database_url=database_url)
     request_payload = {
-        "query": payload.query,
-        "stock": payload.stock,
-        "conversation_id": payload.conversation_id,
-        "messages": [message.model_dump() for message in payload.messages],
-        "source": "quant_web",
+        "symbol": symbol,
+        "objective": payload.query,
     }
     body = json.dumps(request_payload, ensure_ascii=False).encode("utf-8")
     request = Request(
@@ -853,11 +1129,16 @@ def _call_re_agent_chat(payload: ReAgentChatRequest, base_url: str, chat_path: s
         data = {"answer": response_text}
 
     answer = _extract_re_agent_answer(data)
-    return {
+    result = {
         "answer": answer,
         "conversation_id": _extract_re_agent_conversation_id(data, payload.conversation_id),
-        "raw": data,
+        "symbol": symbol,
     }
+    if isinstance(data, dict):
+        for key in ("rating", "confidence", "scope", "objective"):
+            if key in data:
+                result[key] = data[key]
+    return result
 
 
 def _extract_re_agent_answer(data: Any) -> str:
@@ -865,6 +1146,8 @@ def _extract_re_agent_answer(data: Any) -> str:
         return data
     if not isinstance(data, dict):
         return json.dumps(data, ensure_ascii=False)
+    if any(key in data for key in ("rating", "thesis", "findings")):
+        return _format_single_symbol_research(data)
     for key in ("answer", "content", "message", "response", "text", "result"):
         value = data.get(key)
         if isinstance(value, str) and value.strip():
@@ -884,6 +1167,58 @@ def _extract_re_agent_answer(data: Any) -> str:
             if isinstance(first.get("text"), str):
                 return first["text"]
     return json.dumps(data, ensure_ascii=False)
+
+
+def _format_single_symbol_research(data: dict[str, Any]) -> str:
+    parts: list[str] = []
+    rating = data.get("rating")
+    if rating:
+        parts.append(f"评级：{rating}")
+    confidence = data.get("confidence")
+    if confidence is not None:
+        parts.append(f"置信度：{confidence}")
+    thesis = data.get("thesis")
+    if thesis:
+        parts.append(f"投资观点：\n{thesis}")
+    findings = data.get("findings")
+    if findings:
+        parts.append(f"关键发现：\n{_format_findings(findings)}")
+    risks = data.get("risks")
+    if risks:
+        parts.append(f"主要风险：\n{_format_findings(risks)}")
+    open_questions = data.get("open_questions")
+    if open_questions:
+        parts.append(f"待确认问题：\n{_format_findings(open_questions)}")
+    return "\n\n".join(parts) if parts else json.dumps(data, ensure_ascii=False)
+
+
+def _format_findings(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        lines = []
+        for item in value:
+            if isinstance(item, str):
+                lines.append(f"- {item}")
+            elif isinstance(item, dict):
+                title = item.get("title") or item.get("name") or item.get("metric") or ""
+                detail = item.get("detail") or item.get("description") or item.get("value") or item
+                lines.append(f"- {title}: {detail}" if title else f"- {detail}")
+            else:
+                lines.append(f"- {item}")
+        return "\n".join(lines)
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _resolve_re_agent_symbol(stock: str, database_url: str) -> str:
+    stock_text = stock.strip()
+    if stock_text.isdigit() and len(stock_text) <= 6:
+        return stock_text.zfill(6)
+    if stock_text:
+        results = search_stocks(query=stock_text, limit=1, database_url=database_url).get("results", [])
+        if results:
+            return str(results[0]["symbol"])
+    raise HTTPException(status_code=400, detail="请输入股票代码，或输入能匹配到唯一股票的名称。")
 
 
 def _extract_re_agent_conversation_id(data: Any, fallback: str | None) -> str | None:

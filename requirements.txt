@@ -1,4 +1,6 @@
 akshare>=1.16.80
+baostock>=0.9.1
+mootdx>=0.10.0
 pandas>=2.2.0
 numpy>=1.26.0
 fastapi>=0.115.0

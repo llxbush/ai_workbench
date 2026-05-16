@@ -13,6 +13,15 @@ from typing import Iterable
 import pandas as pd
 import requests
 
+from src.quant_data.providers.base import ProviderResult
+from src.quant_data.providers.baostock_daily import BaostockDailyBarProvider
+from src.quant_data.providers.daily_bars import (
+    AkshareSinaDailyBarProvider,
+    AkshareTencentDailyBarProvider,
+    MootdxDailyBarProvider,
+)
+from src.quant_data.router import DailyBarRouter
+
 try:
     import akshare as ak
 except ImportError as exc:  # pragma: no cover
@@ -58,6 +67,19 @@ class MarketDataClient:
         (self.cache_dir / "summary").mkdir(parents=True, exist_ok=True)
         (self.data_dir / "daily_store").mkdir(parents=True, exist_ok=True)
         (self.data_dir / "reports").mkdir(parents=True, exist_ok=True)
+        self.daily_bar_router = DailyBarRouter(
+            providers=[
+                MootdxDailyBarProvider(),
+                AkshareTencentDailyBarProvider(ak=ak),
+                BaostockDailyBarProvider(),
+                AkshareSinaDailyBarProvider(ak=ak, lock=SINA_DAILY_LOCK),
+            ],
+            min_interval_by_source={
+                "tencent_akshare": 0.25,
+                "baostock": 0.2,
+                "sina_akshare": 0.4,
+            },
+        )
 
     def get_stock_list(self) -> pd.DataFrame:
         cache_file = self.cache_dir / "summary" / "stock_list.csv"
@@ -116,20 +138,49 @@ class MarketDataClient:
         retries: int = 2,
         retry_wait_seconds: float = 0.8,
     ) -> pd.DataFrame:
+        return self.get_daily_bars_result(
+            symbol=symbol,
+            start_date=start_date,
+            end_date=end_date,
+            adjust=adjust,
+            persist_cache=persist_cache,
+            raise_on_error=raise_on_error,
+            retries=retries,
+            retry_wait_seconds=retry_wait_seconds,
+        ).data
+
+    def get_daily_bars_result(
+        self,
+        symbol: str,
+        start_date: str,
+        end_date: str,
+        adjust: str = "qfq",
+        persist_cache: bool = True,
+        raise_on_error: bool = False,
+        retries: int = 2,
+        retry_wait_seconds: float = 0.8,
+    ) -> ProviderResult:
         cache_file = self.cache_dir / "daily" / f"{symbol}_{start_date}_{end_date}_{adjust}.csv"
         if self.use_cache and persist_cache and cache_file.exists():
             cached = pd.read_csv(cache_file, parse_dates=["date"])
-            return cached.sort_values("date").reset_index(drop=True)
+            return ProviderResult(
+                data=cached.sort_values("date").reset_index(drop=True),
+                source="local_cache",
+                quality_flags=[],
+            )
 
         last_error: Exception | None = None
+        result: ProviderResult | None = None
         for attempt in range(retries + 1):
             try:
-                raw = self._fetch_daily_bars_from_any_source(
+                result = self.daily_bar_router.fetch(
                     symbol=symbol,
                     start_date=start_date,
                     end_date=end_date,
                     adjust=adjust,
+                    require_complete_volume=True,
                 )
+                raw = result.data
                 break
             except Exception as exc:
                 last_error = exc
@@ -142,9 +193,21 @@ class MarketDataClient:
         if raw is None:
             if raise_on_error and last_error is not None:
                 raise last_error
-            return pd.DataFrame(columns=["date", "open", "close", "high", "low", "volume"])
+            return ProviderResult(
+                data=pd.DataFrame(columns=["date", "open", "close", "high", "low", "volume"]),
+                source="none",
+                quality_flags=["empty"],
+                error=f"{type(last_error).__name__}: {last_error}" if last_error is not None else None,
+            )
         if raw.empty:
-            return pd.DataFrame(columns=["date", "open", "close", "high", "low", "volume"])
+            if raise_on_error and result is not None and result.error:
+                raise RuntimeError(result.error)
+            return ProviderResult(
+                data=pd.DataFrame(columns=["date", "open", "close", "high", "low", "volume"]),
+                source=result.source if result is not None else "none",
+                quality_flags=result.quality_flags if result is not None else ["empty"],
+                error=result.error if result is not None else None,
+            )
 
         bars = raw.rename(
             columns={
@@ -166,7 +229,12 @@ class MarketDataClient:
 
         if self.use_cache and persist_cache:
             bars.to_csv(cache_file, index=False)
-        return bars
+        return ProviderResult(
+            data=bars,
+            source=result.source if result is not None else "unknown",
+            quality_flags=result.quality_flags if result is not None else [],
+            error=result.error if result is not None else None,
+        )
 
     def _fetch_daily_bars_from_any_source(
         self,
@@ -175,14 +243,10 @@ class MarketDataClient:
         end_date: str,
         adjust: str = "qfq",
     ) -> pd.DataFrame:
-        # Beijing exchange symbols are handled most reliably by Eastmoney here.
         if str(symbol).startswith(("4", "8", "9")):
-            loaders = [
-                lambda: self._fetch_daily_bars_from_eastmoney(symbol, start_date, end_date, adjust),
-            ]
+            loaders = []
         else:
             loaders = [
-                lambda: self._fetch_daily_bars_from_eastmoney(symbol, start_date, end_date, adjust),
                 lambda: self._fetch_daily_bars_from_tencent(symbol, start_date, end_date, adjust),
                 lambda: self._fetch_daily_bars_from_sina(symbol, start_date, end_date, adjust),
             ]

@@ -9,14 +9,14 @@ import uvicorn
 from src.quant_backtest.backtest import run_backtest
 from src.quant_web.app import create_app
 from src.quant_web.db import DEFAULT_DATABASE_URL, init_db
-from src.quant_web.service import run_daily_update_and_ingest, run_screen
+from src.quant_web.service import run_daily_quality_repair, run_daily_update_and_ingest, run_screen
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="A-share simple backtest with AKShare")
     parser.add_argument(
         "--mode",
-        choices=["backtest", "screen", "download-daily", "update-daily", "serve"],
+        choices=["backtest", "screen", "download-daily", "update-daily", "repair-daily-quality", "serve"],
         default="backtest",
     )
     parser.add_argument("--start", help="Start date, e.g. 2020-01-01")
@@ -62,19 +62,30 @@ def main() -> None:
         uvicorn.run(app, host=args.host, port=args.port)
         return
 
-    if args.mode in {"download-daily", "update-daily"}:
+    if args.mode in {"download-daily", "update-daily", "repair-daily-quality"}:
         if not args.end:
-            raise SystemExit("--mode download-daily/update-daily 时必须提供 --end")
+            raise SystemExit("--mode download-daily/update-daily/repair-daily-quality 时必须提供 --end")
         start_date = args.start or "2010-01-01"
-        result = run_daily_update_and_ingest(
-            start_date=start_date,
-            end_date=args.end,
-            max_stocks=args.max_stocks,
-            workers=max(1, args.workers),
-            database_url=args.database_url,
-            cache_dir=Path(args.cache_dir),
-        )
-        print("\n=== MySQL 日线更新结果 ===")
+        if args.mode == "repair-daily-quality":
+            result = run_daily_quality_repair(
+                start_date=start_date,
+                end_date=args.end,
+                max_stocks=args.max_stocks,
+                workers=max(1, args.workers),
+                database_url=args.database_url,
+                cache_dir=Path(args.cache_dir),
+            )
+            print("\n=== MySQL 日线质量修复结果 ===")
+        else:
+            result = run_daily_update_and_ingest(
+                start_date=start_date,
+                end_date=args.end,
+                max_stocks=args.max_stocks,
+                workers=max(1, args.workers),
+                database_url=args.database_url,
+                cache_dir=Path(args.cache_dir),
+            )
+            print("\n=== MySQL 日线更新结果 ===")
         print(f"计划处理股票数: {result['processed']}")
         print(f"写入/更新行数: {result['database_upsert_rows']}")
         print(f"状态分布: {result['status_counts']}")

@@ -18,6 +18,8 @@ from sqlalchemy import (
     UniqueConstraint,
     create_engine,
     func,
+    inspect,
+    text,
 )
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
@@ -64,6 +66,7 @@ class DailyBar(Base):
     amount: Mapped[float | None] = mapped_column(Numeric(20, 2), nullable=True)
     turnover: Mapped[float | None] = mapped_column(Numeric(12, 4), nullable=True)
     data_source: Mapped[str] = mapped_column(String(32), default="akshare_web")
+    quality_flags: Mapped[list | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[object] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[object] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
 
@@ -105,6 +108,8 @@ class SyncRunItem(Base):
     rows_added: Mapped[int] = mapped_column(Integer, default=0)
     total_rows: Mapped[int] = mapped_column(Integer, default=0)
     download_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    data_source: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    quality_flags: Mapped[list | None] = mapped_column(JSON, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     suspension_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
     expected_resume_date: Mapped[object | None] = mapped_column(Date, nullable=True)
@@ -141,6 +146,29 @@ def build_session_factory(database_url: str = DEFAULT_DATABASE_URL):
 def init_db(database_url: str = DEFAULT_DATABASE_URL) -> None:
     engine = build_engine(database_url=database_url)
     Base.metadata.create_all(engine)
+    _ensure_runtime_columns(engine)
+
+
+def _ensure_runtime_columns(engine) -> None:
+    inspector = inspect(engine)
+    table_columns = {
+        table_name: {column["name"] for column in inspector.get_columns(table_name)}
+        for table_name in ("daily_bars", "sync_run_items")
+        if inspector.has_table(table_name)
+    }
+    statements: list[str] = []
+    if "daily_bars" in table_columns and "quality_flags" not in table_columns["daily_bars"]:
+        statements.append("ALTER TABLE daily_bars ADD COLUMN quality_flags JSON NULL AFTER data_source")
+    if "sync_run_items" in table_columns:
+        if "data_source" not in table_columns["sync_run_items"]:
+            statements.append("ALTER TABLE sync_run_items ADD COLUMN data_source VARCHAR(32) NULL AFTER download_reason")
+        if "quality_flags" not in table_columns["sync_run_items"]:
+            statements.append("ALTER TABLE sync_run_items ADD COLUMN quality_flags JSON NULL AFTER data_source")
+    if not statements:
+        return
+    with engine.begin() as connection:
+        for statement in statements:
+            connection.execute(text(statement))
 
 
 @contextmanager
