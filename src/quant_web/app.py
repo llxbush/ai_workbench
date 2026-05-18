@@ -20,7 +20,11 @@ from pydantic import BaseModel, Field
 
 from .db import DEFAULT_DATABASE_URL, init_db, safe_database_url
 from .service import (
+    acquire_update_daily_run,
+    fail_stale_update_runs,
+    get_current_update_run,
     get_overview,
+    get_run_progress,
     get_stock_bars,
     run_daily_quality_repair,
     run_daily_update_and_ingest,
@@ -69,12 +73,15 @@ _RESTART_SCHEDULED = False
 
 def create_app(database_url: str = DEFAULT_DATABASE_URL) -> FastAPI:
     init_db(database_url=database_url)
+    fail_stale_update_runs(database_url=database_url)
     app = FastAPI(title="Quant Service", version="0.1.0")
     app.state.database_url = database_url
     app.state.re_agent_base_url = getenv("RE_AGENT_BASE_URL", "http://127.0.0.1:8010")
     app.state.re_agent_chat_path = getenv("RE_AGENT_CHAT_PATH", "/research/single-symbol")
     app.state.started_at = datetime.now(timezone.utc)
     app.state.started_monotonic = time.monotonic()
+    app.state.update_task_lock = threading.Lock()
+    app.state.update_threads: dict[int, threading.Thread] = {}
 
     @app.get("/api/health")
     def health() -> dict:
@@ -120,16 +127,64 @@ def create_app(database_url: str = DEFAULT_DATABASE_URL) -> FastAPI:
 
     @app.post("/api/tasks/update-daily")
     def update_daily(payload: UpdateRequest) -> dict:
+        database_url = app.state.database_url
         end_date = payload.end_date or datetime.now().date().isoformat()
         backfill_start_date = payload.start_date or payload.backfill_start_date or "2010-01-01"
-        return run_daily_update_and_ingest(
-            end_date=end_date,
-            start_date=backfill_start_date,
-            workers=payload.workers,
-            max_stocks=payload.max_stocks,
-            database_url=app.state.database_url,
-            cache_dir=Path("data") / "cache",
-        )
+        cache_dir = Path("data") / "cache"
+        with app.state.update_task_lock:
+            start_result = acquire_update_daily_run(
+                database_url=database_url,
+                start_date=backfill_start_date,
+                end_date=end_date,
+                params={
+                    "workers": payload.workers,
+                    "max_stocks": payload.max_stocks,
+                    "cache_dir": str(cache_dir),
+                },
+            )
+            if not start_result["created"]:
+                return {
+                    "ok": True,
+                    "run_id": start_result["run_id"],
+                    "status": start_result["status"],
+                    "message": start_result["message"],
+                    "progress": start_result["progress"],
+                }
+
+            run_id = start_result["run_id"]
+
+            def _run_in_background() -> None:
+                try:
+                    run_daily_update_and_ingest(
+                        end_date=end_date,
+                        start_date=backfill_start_date,
+                        workers=payload.workers,
+                        max_stocks=payload.max_stocks,
+                        database_url=database_url,
+                        cache_dir=cache_dir,
+                        run_id=run_id,
+                    )
+                finally:
+                    app.state.update_threads.pop(run_id, None)
+
+            thread = threading.Thread(target=_run_in_background, name=f"update-daily-{run_id}", daemon=True)
+            app.state.update_threads[run_id] = thread
+            thread.start()
+
+        return {
+            "ok": True,
+            "run_id": run_id,
+            "status": "started",
+            "message": "同步任务已启动",
+        }
+
+    @app.get("/api/tasks/{run_id}/progress")
+    def task_progress(run_id: int) -> dict:
+        return get_run_progress(run_id=run_id, database_url=app.state.database_url)
+
+    @app.get("/api/tasks/update-daily/current")
+    def current_update_daily() -> dict:
+        return get_current_update_run(database_url=app.state.database_url)
 
     @app.post("/api/tasks/repair-daily-recent")
     def repair_daily_recent(payload: RepairRecentRequest) -> dict:
@@ -428,6 +483,88 @@ def create_app(database_url: str = DEFAULT_DATABASE_URL) -> FastAPI:
       margin-top: 10px;
     }
     .service-actions button { margin-top: 0; }
+    .sync-progress {
+      margin-top: 14px;
+      padding: 14px;
+      border-radius: 14px;
+      background: rgba(255,255,255,0.48);
+      border: 1px solid rgba(35, 28, 22, 0.08);
+    }
+    .progress-status {
+      font-weight: 700;
+      font-size: 15px;
+      margin-bottom: 10px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .progress-status.running { color: var(--accent-2); }
+    .progress-status.completed { color: var(--accent-2); }
+    .progress-status.failed { color: var(--accent); }
+    .progress-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      display: inline-block;
+    }
+    .progress-dot.running {
+      background: var(--accent-2);
+      animation: pulse 1.2s ease-in-out infinite;
+    }
+    .progress-dot.completed { background: var(--accent-2); }
+    .progress-dot.failed { background: var(--accent); }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.3; }
+    }
+    .progress-track {
+      height: 10px;
+      border-radius: 999px;
+      background: rgba(35, 28, 22, 0.08);
+      overflow: hidden;
+      margin-bottom: 8px;
+    }
+    .progress-bar {
+      height: 100%;
+      border-radius: 999px;
+      background: linear-gradient(90deg, var(--accent-2), #3aa88f);
+      transition: width 0.4s ease;
+      min-width: 0;
+    }
+    .progress-bar.failed { background: linear-gradient(90deg, var(--accent), #d4735a); }
+    .progress-percent {
+      font-size: 28px;
+      font-weight: 700;
+      margin-bottom: 8px;
+      color: var(--text);
+    }
+    .progress-stats {
+      display: flex;
+      gap: 16px;
+      flex-wrap: wrap;
+      font-size: 13px;
+      color: var(--muted);
+      margin-bottom: 4px;
+    }
+    .progress-stat-success { color: var(--accent-2); font-weight: 700; }
+    .progress-stat-failed { color: var(--accent); font-weight: 700; }
+    .progress-current {
+      margin-top: 8px;
+      font-size: 13px;
+      color: var(--muted);
+      line-height: 1.5;
+    }
+    .progress-current strong { color: var(--text); }
+    .progress-recent {
+      margin-top: 10px;
+      font-size: 12px;
+      color: var(--muted);
+      line-height: 1.6;
+    }
+    .progress-recent-item {
+      padding-top: 4px;
+      border-top: 1px dashed rgba(35, 28, 22, 0.08);
+    }
     @media (max-width: 760px) {
       .quote-toolbar { grid-template-columns: 1fr; }
       .agent-panel { grid-template-columns: 1fr; }
@@ -473,6 +610,28 @@ def create_app(database_url: str = DEFAULT_DATABASE_URL) -> FastAPI:
         <label>修复最近 N 日</label>
         <input id="repairLookbackDays" value="10" />
         <button id="repairRecentButton" class="secondary" onclick="runRecentRepair()">修复最近日线</button>
+        <div id="updateProgress" class="sync-progress" style="display:none;">
+          <div class="progress-status" id="progressStatus">
+            <span class="progress-dot running"></span>
+            <span id="progressStatusText">准备中</span>
+          </div>
+          <div class="progress-track">
+            <div class="progress-bar" id="progressBar" style="width:0%"></div>
+          </div>
+          <div class="progress-percent" id="progressPercent">0%</div>
+          <div class="progress-stats">
+            <span>已同步 <strong id="progressDone">0</strong></span>
+            <span>剩余 <strong id="progressRemaining">0</strong></span>
+            <span>总计 <strong id="progressTotal">0</strong></span>
+          </div>
+          <div class="progress-stats">
+            <span class="progress-stat-success">成功 <strong id="progressSuccess">0</strong></span>
+            <span class="progress-stat-failed">失败 <strong id="progressFailed">0</strong></span>
+            <span>跳过 <strong id="progressSkipped">0</strong></span>
+          </div>
+          <div class="progress-current" id="progressCurrent"></div>
+          <div class="progress-recent" id="progressRecent"></div>
+        </div>
       </div>
 
       <div class="card">
@@ -557,6 +716,10 @@ def create_app(database_url: str = DEFAULT_DATABASE_URL) -> FastAPI:
     document.getElementById("screenTradeDate").value = today;
     let agentMessages = [];
     let agentConversationId = null;
+    let updatePollTimer = null;
+    let activeUpdateRunId = null;
+    let updatePollFailures = 0;
+    const UPDATE_POLL_MAX_FAILURES = 5;
 
     async function api(path, method = "GET", payload) {
       const res = await fetch(path, {
@@ -702,15 +865,155 @@ def create_app(database_url: str = DEFAULT_DATABASE_URL) -> FastAPI:
       });
     }
 
+    function stopUpdateProgressPolling() {
+      if (updatePollTimer) {
+        clearTimeout(updatePollTimer);
+        updatePollTimer = null;
+      }
+      activeUpdateRunId = null;
+      updatePollFailures = 0;
+      const button = document.getElementById("updateButton");
+      button.disabled = false;
+      button.textContent = "同步到最新";
+    }
+
+    function renderUpdateProgress(data) {
+      const container = document.getElementById("updateProgress");
+      container.style.display = "block";
+
+      const total = data.total || 0;
+      const processed = data.processed || 0;
+      const remaining = data.remaining || 0;
+      const percent = data.percent || 0;
+      const status = data.status || "unknown";
+
+      document.getElementById("progressPercent").textContent = `${percent}%`;
+      document.getElementById("progressDone").textContent = processed;
+      document.getElementById("progressRemaining").textContent = remaining;
+      document.getElementById("progressTotal").textContent = total;
+      document.getElementById("progressSuccess").textContent = data.success || 0;
+      document.getElementById("progressFailed").textContent = data.failed || 0;
+      document.getElementById("progressSkipped").textContent = data.skipped || 0;
+
+      const bar = document.getElementById("progressBar");
+      bar.classList.remove("failed");
+      bar.style.width = `${Math.min(100, Math.max(0, percent))}%`;
+
+      const statusEl = document.getElementById("progressStatus");
+      const statusText = document.getElementById("progressStatusText");
+      const dot = statusEl.querySelector(".progress-dot");
+
+      if (status === "running") {
+        statusEl.className = "progress-status running";
+        dot.className = "progress-dot running";
+        statusText.textContent = total === 0 ? "准备中" : "同步中";
+      } else if (status === "completed") {
+        statusEl.className = "progress-status completed";
+        dot.className = "progress-dot completed";
+        statusText.textContent = "已完成";
+      } else if (status === "failed") {
+        statusEl.className = "progress-status failed";
+        dot.className = "progress-dot failed";
+        statusText.textContent = "失败";
+        bar.classList.add("failed");
+      } else if (status === "already_running") {
+        statusEl.className = "progress-status running";
+        dot.className = "progress-dot running";
+        statusText.textContent = "同步中";
+      } else {
+        statusEl.className = "progress-status";
+        dot.className = "progress-dot";
+        statusText.textContent = status;
+      }
+
+      const currentParts = [];
+      if (data.current_symbol) {
+        currentParts.push(`当前 <strong>${escapeHtml(data.current_symbol)} ${escapeHtml(data.current_name || "")}</strong>`);
+      } else if (total === 0 && status === "running") {
+        currentParts.push("正在生成同步队列...");
+      }
+      if (data.message) {
+        currentParts.push(escapeHtml(data.message));
+      }
+      if (status === "failed" && (data.last_error || data.message)) {
+        currentParts.push(`错误: ${escapeHtml(data.last_error || data.message || "未知错误")}`);
+      }
+      document.getElementById("progressCurrent").innerHTML = currentParts.join("<br>");
+
+      const recent = Array.isArray(data.recent_items) ? data.recent_items : [];
+      const recentEl = document.getElementById("progressRecent");
+      if (!recent.length) {
+        recentEl.innerHTML = "";
+      } else {
+        recentEl.innerHTML = recent.map(item => {
+          const label = `${escapeHtml(item.symbol || "")} ${escapeHtml(item.name || "")}`.trim();
+          const extra = item.status === "failed"
+            ? `失败: ${escapeHtml(item.error_message || "未知错误")}`
+            : `${escapeHtml(item.status || "")}${item.rows_added ? `，新增 ${item.rows_added} 行` : ""}`;
+          return `<div class="progress-recent-item">${label} · ${extra}</div>`;
+        }).join("");
+      }
+    }
+
+    async function pollUpdateProgress(runId) {
+      try {
+        const data = await api(`/api/tasks/${runId}/progress`);
+        updatePollFailures = 0;
+        renderUpdateProgress(data);
+
+        if (data.status === "running") {
+          updatePollTimer = setTimeout(() => pollUpdateProgress(runId), 1500);
+        } else {
+          stopUpdateProgressPolling();
+          if (data.status === "completed") {
+            showResult({ok: true, action: "update_daily", status: "completed", run_id: runId, ...data});
+            await loadOverview();
+          } else {
+            showResult({ok: false, action: "update_daily", status: data.status, run_id: runId, error: data.last_error || data.message});
+          }
+        }
+      } catch (error) {
+        updatePollFailures += 1;
+        document.getElementById("progressCurrent").textContent = `进度读取失败，稍后重试... (${updatePollFailures}/${UPDATE_POLL_MAX_FAILURES})`;
+        if (updatePollFailures >= UPDATE_POLL_MAX_FAILURES) {
+          showResult({ok: false, action: "update_daily", status: "poll_failed", run_id: runId, error: "进度读取连续失败，请稍后重试或刷新页面恢复。"});
+          stopUpdateProgressPolling();
+          return;
+        }
+        updatePollTimer = setTimeout(() => pollUpdateProgress(runId), 3000);
+      }
+    }
+
     async function runUpdate() {
-      await withButton("updateButton", "同步中...", "update_daily", async () => {
+      const button = document.getElementById("updateButton");
+      if (button.disabled) return;
+
+      stopUpdateProgressPolling();
+      button.disabled = true;
+      button.textContent = "启动中...";
+      showResult({ok: true, action: "update_daily", status: "starting"});
+
+      try {
         const data = await api("/api/tasks/update-daily", "POST", {
           workers: Number(document.getElementById("updateWorkers").value || 8),
           max_stocks: Number(document.getElementById("updateMaxStocks").value || 0)
         });
-        showResult(data);
-        await loadOverview();
-      });
+
+        if (data.status === "already_running") {
+          activeUpdateRunId = data.run_id;
+          renderUpdateProgress(data.progress);
+          document.getElementById("progressCurrent").textContent = "已有同步任务正在运行，正在监听进度...";
+        } else {
+          activeUpdateRunId = data.run_id;
+          renderUpdateProgress({total: 0, processed: 0, remaining: 0, percent: 0, success: 0, failed: 0, skipped: 0, status: "running", current_symbol: "", current_name: "", message: "正在生成同步队列..."});
+        }
+
+        button.textContent = "同步中...";
+        pollUpdateProgress(data.run_id);
+      } catch (error) {
+        showError("update_daily", error);
+        stopUpdateProgressPolling();
+      }
     }
 
     async function runRecentRepair() {
@@ -1012,10 +1315,27 @@ def create_app(database_url: str = DEFAULT_DATABASE_URL) -> FastAPI:
       }
     });
 
+    async function resumeUpdateProgressOnLoad() {
+      try {
+        const data = await api("/api/tasks/update-daily/current");
+        if (data.running) {
+          activeUpdateRunId = data.run_id;
+          renderUpdateProgress(data);
+          const button = document.getElementById("updateButton");
+          button.disabled = true;
+          button.textContent = "同步中...";
+          pollUpdateProgress(data.run_id);
+        }
+      } catch (error) {
+        // 静默失败，不影响页面加载
+      }
+    }
+
     renderAgentThread();
     loadServiceStatus().catch(() => {});
     loadOverview();
     loadStockQuote("000001").catch(() => {});
+    resumeUpdateProgressOnLoad();
   </script>
 </body>
 </html>

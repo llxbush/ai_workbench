@@ -51,10 +51,10 @@ def tencent_quote(codes: list[str], timeout_seconds: float = 10.0) -> dict[str, 
 
 def _to_tencent_symbol(code: str) -> str:
     normalized = str(code).zfill(6)
-    if normalized.startswith(("6", "9")):
-        return f"sh{normalized}"
-    if normalized.startswith(("4", "8")):
+    if normalized.startswith(("4", "8", "9")):
         return f"bj{normalized}"
+    if normalized.startswith("6"):
+        return f"sh{normalized}"
     return f"sz{normalized}"
 
 

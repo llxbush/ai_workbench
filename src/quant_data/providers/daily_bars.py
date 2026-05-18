@@ -15,16 +15,16 @@ from .base import DailyBarProvider, ProviderCapability, ProviderResult
 
 def _market_code(symbol: str) -> str:
     symbol = str(symbol).zfill(6)
-    if symbol.startswith(("6", "9")):
-        return "sh"
-    if symbol.startswith(("4", "8")):
+    if symbol.startswith(("4", "8", "9")):
         return "bj"
+    if symbol.startswith("6"):
+        return "sh"
     return "sz"
 
 
 def _eastmoney_secid(symbol: str) -> str:
     symbol = str(symbol).zfill(6)
-    if symbol.startswith(("6", "9")):
+    if symbol.startswith("6"):
         return f"1.{symbol}"
     return f"0.{symbol}"
 

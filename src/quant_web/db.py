@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from functools import lru_cache
 from os import getenv
+from threading import Lock
 from typing import Iterator
 
 from sqlalchemy import (
@@ -26,6 +28,8 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sess
 
 
 DEFAULT_DATABASE_URL = getenv("QUANT_DATABASE_URL", "")
+_INIT_LOCK = Lock()
+_INITIALIZED_DATABASE_URLS: set[str] = set()
 
 
 class Base(DeclarativeBase):
@@ -86,6 +90,11 @@ class SyncRun(Base):
     success_symbols: Mapped[int] = mapped_column(Integer, default=0)
     failed_symbols: Mapped[int] = mapped_column(Integer, default=0)
     skipped_symbols: Mapped[int] = mapped_column(Integer, default=0)
+    processed_symbols: Mapped[int] = mapped_column(Integer, default=0)
+    current_symbol: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    current_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    progress_percent: Mapped[float] = mapped_column(Numeric(6, 2), default=0)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     params_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     message: Mapped[str | None] = mapped_column(Text, nullable=True)
     started_at: Mapped[object] = mapped_column(DateTime, server_default=func.now(), index=True)
@@ -133,27 +142,37 @@ def safe_database_url(database_url: str) -> str:
     return make_url(database_url).render_as_string(hide_password=True)
 
 
+@lru_cache(maxsize=None)
 def build_engine(database_url: str = DEFAULT_DATABASE_URL):
     ensure_mysql_url(database_url)
-    return create_engine(database_url, future=True, pool_pre_ping=True)
+    return create_engine(database_url, future=True, pool_pre_ping=True, pool_recycle=3600)
 
 
+@lru_cache(maxsize=None)
 def build_session_factory(database_url: str = DEFAULT_DATABASE_URL):
     engine = build_engine(database_url=database_url)
     return sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
 
 
-def init_db(database_url: str = DEFAULT_DATABASE_URL) -> None:
+def init_db(database_url: str = DEFAULT_DATABASE_URL, *, force: bool = False) -> None:
+    ensure_mysql_url(database_url)
+    if not force:
+        with _INIT_LOCK:
+            if database_url in _INITIALIZED_DATABASE_URLS:
+                return
     engine = build_engine(database_url=database_url)
-    Base.metadata.create_all(engine)
-    _ensure_runtime_columns(engine)
+    with _INIT_LOCK:
+        if force or database_url not in _INITIALIZED_DATABASE_URLS:
+            Base.metadata.create_all(engine)
+            _ensure_runtime_columns(engine)
+            _INITIALIZED_DATABASE_URLS.add(database_url)
 
 
 def _ensure_runtime_columns(engine) -> None:
     inspector = inspect(engine)
     table_columns = {
         table_name: {column["name"] for column in inspector.get_columns(table_name)}
-        for table_name in ("daily_bars", "sync_run_items")
+        for table_name in ("daily_bars", "sync_run_items", "sync_runs")
         if inspector.has_table(table_name)
     }
     statements: list[str] = []
@@ -164,6 +183,18 @@ def _ensure_runtime_columns(engine) -> None:
             statements.append("ALTER TABLE sync_run_items ADD COLUMN data_source VARCHAR(32) NULL AFTER download_reason")
         if "quality_flags" not in table_columns["sync_run_items"]:
             statements.append("ALTER TABLE sync_run_items ADD COLUMN quality_flags JSON NULL AFTER data_source")
+    if "sync_runs" in table_columns:
+        sync_runs_cols = table_columns["sync_runs"]
+        if "processed_symbols" not in sync_runs_cols:
+            statements.append("ALTER TABLE sync_runs ADD COLUMN processed_symbols INT NOT NULL DEFAULT 0 AFTER skipped_symbols")
+        if "current_symbol" not in sync_runs_cols:
+            statements.append("ALTER TABLE sync_runs ADD COLUMN current_symbol VARCHAR(16) NULL AFTER processed_symbols")
+        if "current_name" not in sync_runs_cols:
+            statements.append("ALTER TABLE sync_runs ADD COLUMN current_name VARCHAR(64) NULL AFTER current_symbol")
+        if "progress_percent" not in sync_runs_cols:
+            statements.append("ALTER TABLE sync_runs ADD COLUMN progress_percent DECIMAL(6,2) NOT NULL DEFAULT 0 AFTER current_name")
+        if "last_error" not in sync_runs_cols:
+            statements.append("ALTER TABLE sync_runs ADD COLUMN last_error TEXT NULL AFTER progress_percent")
     if not statements:
         return
     with engine.begin() as connection:

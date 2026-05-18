@@ -77,8 +77,8 @@ class DailyBarRouter:
     @staticmethod
     def _market(symbol: str) -> str:
         symbol = str(symbol).zfill(6)
-        if symbol.startswith(("6", "9")):
+        if symbol.startswith("6"):
             return "sh"
-        if symbol.startswith(("4", "8")):
+        if symbol.startswith(("4", "8", "9")):
             return "bj"
         return "sz"
