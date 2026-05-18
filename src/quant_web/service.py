@@ -7,7 +7,7 @@ from typing import Any
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from sqlalchemy import desc, func, or_, select
+from sqlalchemy import desc, func, or_, select, text
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 
 from src.quant_backtest.data import MarketDataClient
@@ -27,6 +27,7 @@ from .db import (
 
 SUCCESS_STATUSES = {"created", "updated", "up_to_date", "no_new_data", "suspended", "repaired"}
 UPSERT_BATCH_SIZE = 1000
+UPDATE_DAILY_LOCK_NAME = "quant:update_daily"
 
 
 def _upsert_daily_bars(
@@ -91,70 +92,6 @@ def _upsert_daily_bars(
     return len(records)
 
 
-def import_daily_store_to_db(
-    database_url: str = DEFAULT_DATABASE_URL,
-    daily_store_dir: Path | None = None,
-    limit: int = 0,
-) -> dict:
-    init_db(database_url=database_url)
-    daily_store_dir = daily_store_dir or Path("data") / "daily_store"
-    files = sorted(daily_store_dir.glob("*_*.csv"))
-    if limit and limit > 0:
-        files = files[:limit]
-
-    stock_names = _load_stock_names()
-    run_id = _create_sync_run(
-        database_url=database_url,
-        run_type="import_daily_store",
-        params={"limit": limit},
-    )
-    imported_files = 0
-    imported_rows = 0
-
-    try:
-        with session_scope(database_url=database_url) as session:
-            for csv_file in files:
-                file_name = csv_file.stem
-                if "_" not in file_name:
-                    continue
-                symbol, adjust = file_name.split("_", 1)
-                symbol = _normalize_symbol(symbol)
-                bars = pd.read_csv(csv_file, parse_dates=["date"])
-                imported_rows += _upsert_daily_bars(
-                    session=session,
-                    symbol=symbol,
-                    adjust=adjust,
-                    bars=bars,
-                    name=stock_names.get(symbol),
-                    data_source="local_csv",
-                    quality_flags=[],
-                )
-                imported_files += 1
-                session.commit()
-
-            run = session.get(SyncRun, run_id)
-            if run is not None:
-                run.status = "completed"
-                run.finished_at = datetime.now()
-                run.total_symbols = imported_files
-                run.success_symbols = imported_files
-                run.message = f"imported_files={imported_files}, imported_rows={imported_rows}"
-    except Exception as exc:
-        _finish_sync_run(
-            database_url=database_url,
-            run_id=run_id,
-            status="failed",
-            message=_short_text(str(exc), 2048),
-        )
-        raise
-
-    return {
-        "imported_files": imported_files,
-        "imported_rows": imported_rows,
-        "database_url": safe_database_url(database_url),
-    }
-
-
 def run_daily_update_and_ingest(
     end_date: str,
     start_date: str = "2010-01-01",
@@ -162,21 +99,24 @@ def run_daily_update_and_ingest(
     max_stocks: int = 0,
     database_url: str = DEFAULT_DATABASE_URL,
     cache_dir: Path | None = None,
+    run_id: int | None = None,
 ) -> dict:
     init_db(database_url=database_url)
     cache_dir = cache_dir or Path("data") / "cache"
     client = MarketDataClient(cache_dir=cache_dir, use_cache=True)
-    run_id = _create_sync_run(
-        database_url=database_url,
-        run_type="update_daily",
-        start_date=start_date,
-        end_date=end_date,
-        params={
-            "workers": workers,
-            "max_stocks": max_stocks,
-            "cache_dir": str(cache_dir),
-        },
-    )
+
+    if run_id is None:
+        run_id = _create_sync_run(
+            database_url=database_url,
+            run_type="update_daily",
+            start_date=start_date,
+            end_date=end_date,
+            params={
+                "workers": workers,
+                "max_stocks": max_stocks,
+                "cache_dir": str(cache_dir),
+            },
+        )
 
     try:
         effective_end_date = client.resolve_effective_end_date(end_date)
@@ -191,55 +131,104 @@ def run_daily_update_and_ingest(
                 max_stocks=max_stocks,
                 adjust="qfq",
             )
-            symbol_to_instrument_id: dict[str, int] = {}
-            if not worklist.empty:
-                if workers <= 1:
-                    fetch_results = [
-                        _fetch_daily_update_for_db(client=client, row=row, end_date=effective_end_date, adjust="qfq")
-                        for _, row in worklist.iterrows()
-                    ]
-                else:
-                    with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
-                        futures = [
-                            executor.submit(
-                                _fetch_daily_update_for_db,
-                                client,
-                                row,
-                                effective_end_date,
-                                "qfq",
-                            )
-                            for _, row in worklist.iterrows()
-                        ]
-                        fetch_results = [future.result() for future in as_completed(futures)]
-
-                for result, bars in fetch_results:
-                    if bars is not None and not bars.empty:
-                        upserted_rows += _upsert_daily_bars(
-                            session=session,
-                            symbol=result["symbol"],
-                            adjust="qfq",
-                            bars=bars,
-                            name=result.get("name"),
-                            data_source=result.get("data_source") or "unknown",
-                            quality_flags=result.get("quality_flags") or [],
-                        )
-                        instrument_id = _get_or_create_instrument_id(
-                            session=session,
-                            symbol=result["symbol"],
-                            name=result.get("name"),
-                        )
-                        symbol_to_instrument_id[result["symbol"]] = instrument_id
-                        session.commit()
-                    rows.append(result)
-
-            result_df = pd.DataFrame(rows)
-
-            _record_sync_run_items(
+            total = len(worklist)
+            _update_sync_run_progress(
                 session=session,
                 run_id=run_id,
-                result_df=result_df,
-                symbol_to_instrument_id=symbol_to_instrument_id,
+                total_symbols=total,
+                processed_symbols=0,
+                message="同步队列已生成",
+                progress_percent=0.0 if total > 0 else 100.0,
             )
+            session.commit()
+
+            if total == 0:
+                _finish_sync_run_in_session(
+                    session=session,
+                    run_id=run_id,
+                    status="completed",
+                    result_df=pd.DataFrame(),
+                    message="无需同步，已是最新",
+                )
+                return {
+                    "processed": 0,
+                    "status_counts": {},
+                    "database_upsert_rows": 0,
+                    "database_url": safe_database_url(database_url),
+                }
+
+            symbol_to_instrument_id: dict[str, int] = {}
+
+            def _process_one_result(result, bars):
+                nonlocal upserted_rows
+                if bars is not None and not bars.empty:
+                    upserted_rows += _upsert_daily_bars(
+                        session=session,
+                        symbol=result["symbol"],
+                        adjust="qfq",
+                        bars=bars,
+                        name=result.get("name"),
+                        data_source=result.get("data_source") or "unknown",
+                        quality_flags=result.get("quality_flags") or [],
+                    )
+                    instrument_id = _get_or_create_instrument_id(
+                        session=session,
+                        symbol=result["symbol"],
+                        name=result.get("name"),
+                    )
+                    symbol_to_instrument_id[result["symbol"]] = instrument_id
+                rows.append(result)
+
+                _record_one_sync_run_item(
+                    session=session,
+                    run_id=run_id,
+                    result=result,
+                    symbol_to_instrument_id=symbol_to_instrument_id,
+                )
+
+                processed = len(rows)
+                success_count = sum(1 for r in rows if r["status"] in SUCCESS_STATUSES)
+                failed_count = sum(1 for r in rows if r["status"] == "failed")
+                skipped_count = processed - success_count - failed_count
+
+                _update_sync_run_progress(
+                    session=session,
+                    run_id=run_id,
+                    processed_symbols=processed,
+                    success_symbols=success_count,
+                    failed_symbols=failed_count,
+                    skipped_symbols=skipped_count,
+                    current_symbol=result["symbol"],
+                    current_name=result.get("name") or result["symbol"],
+                    progress_percent=round(processed / total * 100, 1),
+                    last_error=result.get("error") if result.get("status") == "failed" else None,
+                    message=f"同步中 {processed}/{total}",
+                )
+                session.commit()
+
+            if workers <= 1:
+                for _, row in worklist.iterrows():
+                    result, bars = _fetch_daily_update_for_db(
+                        client=client, row=row, end_date=effective_end_date, adjust="qfq"
+                    )
+                    _process_one_result(result, bars)
+            else:
+                with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
+                    futures = {
+                        executor.submit(
+                            _fetch_daily_update_for_db,
+                            client,
+                            row,
+                            effective_end_date,
+                            "qfq",
+                        ): row
+                        for _, row in worklist.iterrows()
+                    }
+                    for future in as_completed(futures):
+                        result, bars = future.result()
+                        _process_one_result(result, bars)
+
+            result_df = pd.DataFrame(rows)
             _finish_sync_run_in_session(
                 session=session,
                 run_id=run_id,
@@ -544,6 +533,10 @@ def _build_daily_db_worklist(
     stock_list = client.get_stock_list()
     if stock_list.empty:
         return pd.DataFrame(columns=["symbol", "name", "fetch_start", "latest_db_date"])
+    _refresh_instrument_status_from_stock_list(session=session, stock_list=stock_list)
+    stock_list = _exclude_bse_symbols(stock_list)
+    if stock_list.empty:
+        return pd.DataFrame(columns=["symbol", "name", "fetch_start", "latest_db_date"])
 
     instrument_rows = session.execute(select(Instrument.id, Instrument.symbol)).all()
     instrument_id_by_symbol = {symbol: int(instrument_id) for instrument_id, symbol in instrument_rows}
@@ -593,6 +586,85 @@ def _build_daily_db_worklist(
     return worklist.reset_index(drop=True)
 
 
+def _refresh_instrument_status_from_stock_list(session, stock_list: pd.DataFrame) -> dict[str, int]:
+    if stock_list.empty or "symbol" not in stock_list.columns:
+        return {"active": 0, "inactive": 0, "created": 0, "updated": 0}
+
+    refreshed = stock_list.copy()
+    refreshed["symbol"] = refreshed["symbol"].astype(str).str.zfill(6)
+    refreshed = refreshed.drop_duplicates(subset=["symbol"], keep="last").reset_index(drop=True)
+    active_symbols = set(refreshed["symbol"].tolist())
+    # Refresh is keyed only by symbol. Legacy rows may have stale or missing exchange_code,
+    # so we must load all existing instruments here instead of pre-filtering by exchange.
+    current_rows = session.execute(select(Instrument)).scalars().all()
+    current_by_symbol = {row.symbol: row for row in current_rows if row.symbol}
+
+    created = 0
+    updated = 0
+    for _, row in refreshed.iterrows():
+        symbol = _normalize_symbol(row.get("symbol"))
+        if not symbol:
+            continue
+        name = _clean_text(row.get("name")) or symbol
+        instrument = current_by_symbol.get(symbol)
+        if instrument is None:
+            session.add(
+                Instrument(
+                    symbol=symbol,
+                    name=_short_text(name, 64) or symbol,
+                    market=_infer_market(symbol),
+                    exchange_code=_infer_exchange(symbol),
+                    board=_infer_board(symbol),
+                    status="listed",
+                    is_active=True,
+                )
+            )
+            created += 1
+            continue
+
+        changed = False
+        target_name = _short_text(name, 64) or symbol
+        if instrument.name != target_name:
+            instrument.name = target_name
+            changed = True
+        if instrument.market != _infer_market(symbol):
+            instrument.market = _infer_market(symbol)
+            changed = True
+        if instrument.exchange_code != _infer_exchange(symbol):
+            instrument.exchange_code = _infer_exchange(symbol)
+            changed = True
+        if instrument.board != _infer_board(symbol):
+            instrument.board = _infer_board(symbol)
+            changed = True
+        if instrument.status != "listed":
+            instrument.status = "listed"
+            changed = True
+        if instrument.is_active is not True:
+            instrument.is_active = True
+            changed = True
+        if changed:
+            updated += 1
+
+    inactive = 0
+    # Only mark absent symbols inactive after a reasonably complete universe refresh.
+    if len(active_symbols) >= 3000:
+        for symbol, instrument in current_by_symbol.items():
+            if symbol in active_symbols:
+                continue
+            changed = False
+            if instrument.is_active is not False:
+                instrument.is_active = False
+                changed = True
+            if instrument.status != "delisted":
+                instrument.status = "delisted"
+                changed = True
+            if changed:
+                inactive += 1
+
+    session.flush()
+    return {"active": len(active_symbols), "inactive": inactive, "created": created, "updated": updated}
+
+
 def _build_daily_quality_repair_worklist(
     session,
     start_date: str,
@@ -637,12 +709,15 @@ def _build_daily_quality_repair_worklist(
 
     work_rows = []
     for symbol, name, first_bad_date, latest_bad_date, bad_rows in rows:
+        normalized_symbol = _normalize_symbol(symbol)
+        if _is_bse_symbol(normalized_symbol):
+            continue
         first_bad = pd.Timestamp(first_bad_date).strftime("%Y-%m-%d")
         latest_bad = pd.Timestamp(latest_bad_date).strftime("%Y-%m-%d")
         work_rows.append(
             {
-                "symbol": _normalize_symbol(symbol),
-                "name": _clean_text(name) or _normalize_symbol(symbol),
+                "symbol": normalized_symbol,
+                "name": _clean_text(name) or normalized_symbol,
                 "fetch_start": first_bad,
                 "latest_db_date": "",
                 "download_reason": "quality_repair",
@@ -1022,19 +1097,36 @@ def _create_sync_run(
     params: dict[str, Any] | None = None,
 ) -> int:
     with session_scope(database_url=database_url) as session:
-        run = SyncRun(
+        return _create_sync_run_in_session(
+            session=session,
             run_type=run_type,
-            status="running",
-            triggered_by="web",
-            target_date=_parse_date(end_date),
-            start_date=_parse_date(start_date),
-            end_date=_parse_date(end_date),
-            params_json=params or {},
-            message="running",
+            start_date=start_date,
+            end_date=end_date,
+            params=params,
         )
-        session.add(run)
-        session.flush()
-        return int(run.id)
+
+
+def _create_sync_run_in_session(
+    session,
+    *,
+    run_type: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    params: dict[str, Any] | None = None,
+) -> int:
+    run = SyncRun(
+        run_type=run_type,
+        status="running",
+        triggered_by="web",
+        target_date=_parse_date(end_date),
+        start_date=_parse_date(start_date),
+        end_date=_parse_date(end_date),
+        params_json=params or {},
+        message="preparing",
+    )
+    session.add(run)
+    session.flush()
+    return int(run.id)
 
 
 def _finish_sync_run(
@@ -1050,6 +1142,10 @@ def _finish_sync_run(
         run.status = status
         run.finished_at = datetime.now()
         run.message = message
+        if status == "failed":
+            run.last_error = _short_text(message, 2048)
+        if run.total_symbols and run.total_symbols > 0:
+            run.progress_percent = 100.0 if status == "completed" else float(run.progress_percent or 0)
 
 
 def _finish_sync_run_in_session(
@@ -1068,10 +1164,177 @@ def _finish_sync_run_in_session(
     run.status = status
     run.finished_at = datetime.now()
     run.total_symbols = total
+    run.processed_symbols = total
     run.success_symbols = success
     run.failed_symbols = failed
     run.skipped_symbols = max(0, total - success - failed)
+    run.progress_percent = 100.0 if status == "completed" else float(run.progress_percent or 0)
     run.message = _short_text(message, 2048)
+
+
+def _format_run_progress(run: SyncRun) -> dict:
+    total = max(run.total_symbols or 0, 0)
+    processed = max(run.processed_symbols or 0, 0)
+    remaining = max(total - processed, 0)
+    percent = round(float(run.progress_percent or 0), 1) if run.progress_percent else 0.0
+    return {
+        "run_id": int(run.id),
+        "status": run.status or "unknown",
+        "total": total,
+        "processed": processed,
+        "remaining": remaining,
+        "percent": percent,
+        "success": int(run.success_symbols or 0),
+        "failed": int(run.failed_symbols or 0),
+        "skipped": int(run.skipped_symbols or 0),
+        "current_symbol": run.current_symbol or "",
+        "current_name": run.current_name or "",
+        "message": run.message or "",
+        "last_error": run.last_error or "",
+        "started_at": run.started_at.isoformat(sep=" ") if run.started_at else "",
+        "finished_at": run.finished_at.isoformat(sep=" ") if run.finished_at else "",
+    }
+
+
+def get_run_progress(run_id: int, database_url: str = DEFAULT_DATABASE_URL) -> dict:
+    init_db(database_url=database_url)
+    with session_scope(database_url=database_url) as session:
+        run = session.get(SyncRun, run_id)
+        if run is None:
+            return {"run_id": run_id, "status": "not_found", "message": f"SyncRun {run_id} 不存在"}
+        progress = _format_run_progress(run)
+        progress["recent_items"] = _get_recent_run_items(session=session, run_id=run_id, limit=5)
+        return progress
+
+
+def get_current_update_run(database_url: str = DEFAULT_DATABASE_URL) -> dict:
+    init_db(database_url=database_url)
+    with session_scope(database_url=database_url) as session:
+        run = session.execute(
+            select(SyncRun)
+            .where(SyncRun.run_type == "update_daily", SyncRun.status == "running")
+            .order_by(SyncRun.started_at.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        if run is None:
+            return {"running": False}
+        progress = _format_run_progress(run)
+        progress["recent_items"] = _get_recent_run_items(session=session, run_id=int(run.id), limit=5)
+        return {"running": True, **progress}
+
+
+def acquire_update_daily_run(
+    *,
+    database_url: str,
+    start_date: str | None,
+    end_date: str | None,
+    params: dict[str, Any] | None = None,
+) -> dict:
+    init_db(database_url=database_url)
+    with session_scope(database_url=database_url) as session:
+        lock_acquired = session.execute(
+            text("SELECT GET_LOCK(:lock_name, :timeout_seconds)"),
+            {"lock_name": UPDATE_DAILY_LOCK_NAME, "timeout_seconds": 10},
+        ).scalar()
+        if lock_acquired != 1:
+            raise RuntimeError("获取同步任务锁失败，请稍后重试")
+        try:
+            run = session.execute(
+                select(SyncRun)
+                .where(SyncRun.run_type == "update_daily", SyncRun.status == "running")
+                .order_by(SyncRun.started_at.desc())
+                .limit(1)
+            ).scalar_one_or_none()
+            if run is not None:
+                progress = _format_run_progress(run)
+                progress["recent_items"] = _get_recent_run_items(session=session, run_id=int(run.id), limit=5)
+                return {
+                    "created": False,
+                    "run_id": int(run.id),
+                    "status": "already_running",
+                    "message": "已有同步任务正在运行",
+                    "progress": progress,
+                }
+
+            run_id = _create_sync_run_in_session(
+                session=session,
+                run_type="update_daily",
+                start_date=start_date,
+                end_date=end_date,
+                params=params,
+            )
+            return {
+                "created": True,
+                "run_id": run_id,
+                "status": "started",
+                "message": "同步任务已启动",
+            }
+        finally:
+            session.execute(text("SELECT RELEASE_LOCK(:lock_name)"), {"lock_name": UPDATE_DAILY_LOCK_NAME})
+
+
+def fail_stale_update_runs(
+    *,
+    database_url: str,
+    reason: str = "服务重启导致任务中断，请重新发起同步",
+) -> int:
+    init_db(database_url=database_url)
+    with session_scope(database_url=database_url) as session:
+        runs = session.execute(
+            select(SyncRun).where(SyncRun.run_type == "update_daily", SyncRun.status == "running")
+        ).scalars()
+        changed = 0
+        for run in runs:
+            run.status = "failed"
+            run.finished_at = datetime.now()
+            run.message = _short_text(reason, 2048)
+            run.last_error = _short_text(reason, 2048)
+            changed += 1
+        return changed
+
+
+def _update_sync_run_progress(
+    session,
+    run_id: int,
+    *,
+    total_symbols: int | None = None,
+    processed_symbols: int | None = None,
+    success_symbols: int | None = None,
+    failed_symbols: int | None = None,
+    skipped_symbols: int | None = None,
+    current_symbol: str | None = None,
+    current_name: str | None = None,
+    progress_percent: float | None = None,
+    last_error: str | None = None,
+    message: str | None = None,
+    status: str | None = None,
+) -> None:
+    run = session.get(SyncRun, run_id)
+    if run is None:
+        return
+    if total_symbols is not None:
+        run.total_symbols = total_symbols
+    if processed_symbols is not None:
+        run.processed_symbols = processed_symbols
+    if success_symbols is not None:
+        run.success_symbols = success_symbols
+    if failed_symbols is not None:
+        run.failed_symbols = failed_symbols
+    if skipped_symbols is not None:
+        run.skipped_symbols = skipped_symbols
+    if current_symbol is not None:
+        run.current_symbol = current_symbol
+    if current_name is not None:
+        run.current_name = _short_text(current_name, 64)
+    if progress_percent is not None:
+        run.progress_percent = float(progress_percent)
+    if last_error is not None:
+        run.last_error = _short_text(last_error, 2048)
+    if message is not None:
+        run.message = _short_text(message, 2048)
+    if status is not None:
+        run.status = status
+    session.flush()
 
 
 def _record_sync_run_items(
@@ -1113,6 +1376,64 @@ def _record_sync_run_items(
                 expected_resume_date=_parse_date(row.get("expected_resume_date")),
             )
         )
+
+
+def _record_one_sync_run_item(
+    session,
+    run_id: int,
+    result: dict[str, Any],
+    symbol_to_instrument_id: dict[str, int],
+) -> None:
+    symbol = _normalize_symbol(result.get("symbol"))
+    if not symbol:
+        return
+    name = _clean_text(result.get("name")) or symbol
+    instrument_id = symbol_to_instrument_id.get(symbol)
+    if instrument_id is None:
+        instrument_id = _get_or_create_instrument_id(session=session, symbol=symbol, name=name)
+        symbol_to_instrument_id[symbol] = instrument_id
+
+    session.add(
+        SyncRunItem(
+            run_id=run_id,
+            instrument_id=instrument_id,
+            symbol=symbol,
+            name=_short_text(name, 64),
+            status=_short_text(_clean_text(result.get("status")) or "unknown", 16),
+            planned_start_date=_parse_date(result.get("planned_start_date")),
+            latest_date=_parse_date(result.get("latest_date")),
+            before_latest_date=_parse_date(result.get("before_latest_date")),
+            rows_added=_to_int(result.get("rows_added")) or 0,
+            total_rows=_to_int(result.get("total_rows")) or 0,
+            download_reason=_short_text(_clean_text(result.get("download_reason")), 32),
+            data_source=_short_text(_clean_text(result.get("data_source")), 32),
+            quality_flags=_normalize_quality_flags(result.get("quality_flags")),
+            error_message=_clean_text(result.get("error")),
+            suspension_reason=_short_text(_clean_text(result.get("suspension_reason")), 255),
+            expected_resume_date=_parse_date(result.get("expected_resume_date")),
+        )
+    )
+
+
+def _get_recent_run_items(session, run_id: int, limit: int = 5) -> list[dict[str, Any]]:
+    rows = session.execute(
+        select(SyncRunItem)
+        .where(SyncRunItem.run_id == run_id)
+        .order_by(SyncRunItem.id.desc())
+        .limit(max(0, limit))
+    ).scalars()
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        items.append(
+            {
+                "symbol": row.symbol or "",
+                "name": row.name or "",
+                "status": row.status or "",
+                "rows_added": int(row.rows_added or 0),
+                "error_message": row.error_message or "",
+            }
+        )
+    return items
 
 
 def _get_or_create_instrument_id(session, symbol: str, name: str | None = None) -> int:
@@ -1184,6 +1505,18 @@ def _normalize_symbol(value: Any) -> str:
     if not text or text.lower() == "nan":
         return ""
     return text.zfill(6)
+
+
+def _exclude_bse_symbols(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty or "symbol" not in frame.columns:
+        return frame
+    filtered = frame.copy()
+    filtered["symbol"] = filtered["symbol"].astype(str).str.zfill(6)
+    return filtered[~filtered["symbol"].map(_is_bse_symbol)].reset_index(drop=True)
+
+
+def _is_bse_symbol(symbol: str) -> bool:
+    return str(symbol).zfill(6).startswith(("4", "8", "9"))
 
 
 def _parse_date(value: Any):

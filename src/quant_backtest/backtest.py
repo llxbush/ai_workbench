@@ -132,7 +132,6 @@ def screen_latest_candidates(
     use_dividend_filter: bool = True,
     require_profitable: bool = True,
     cache_daily_bars: bool = False,
-    prefer_local_daily_store: bool = True,
     use_cache: bool = True,
     cache_dir: Path | None = None,
 ) -> dict:
@@ -157,16 +156,12 @@ def screen_latest_candidates(
     for _, row in stock_list.iterrows():
         symbol = row["symbol"]
         name = row["name"]
-        bars = pd.DataFrame()
-        if prefer_local_daily_store:
-            bars = client.get_bars_from_store(symbol=symbol, start_date=start_date, end_date=end_date)
-        if bars.empty or len(bars) < 121:
-            bars = client.get_daily_bars(
-                symbol=symbol,
-                start_date=start_date,
-                end_date=end_date,
-                persist_cache=cache_daily_bars,
-            )
+        bars = client.get_daily_bars(
+            symbol=symbol,
+            start_date=start_date,
+            end_date=end_date,
+            persist_cache=cache_daily_bars,
+        )
         if bars.empty or len(bars) < 121:
             history_failed_count += 1
             continue

@@ -1,73 +1,68 @@
 # 个人投资工作台
 
-这是一个面向个人投资研究和日常跟踪的本地工作台。它最初从 A 股日线数据维护、选股和回测脚本长出来，现在正在演进成一个统一入口：
+一个面向个人投资研究的本地 A 股工作台，当前重点是：
 
-- 维护本地 A 股行情数据库
+- 维护本地 MySQL 日线库
 - 查看单只股票行情和 K 线
-- 运行数据同步、选股、回测等研究任务
-- 沉淀未来投资助手 agent 可调用的数据、工具和任务记录
+- 运行日线同步、质量修复、日终选股
+- 保留一个轻量回测入口
+- 通过 Web 页面接入外部 `re_agent` 研究助手
 
-项目不定位为高频交易系统，也不直接替代专业行情终端。它更像一个可持续扩展的个人研究桌面：数据在自己手里，策略可以慢慢迭代，未来 agent 可以通过同一套 Web/API 出口参与分析和执行。
+这个项目不是交易系统，也不是通用量化平台。它更像一套“自己可控的数据底座 + 一个够用的研究台面”。
 
-## 当前能力
+## 当前状态
 
-### 1. 数据底座
+当前主链路已经比较明确：
 
-- 使用 MySQL 作为主数据库，默认通过 `QUANT_DATABASE_URL` 配置连接
-- 使用 `AKShare` 获取 A 股基础信息、日线行情、停复牌、估值和分红等数据
-- 支持首次全量下载历史日线
-- 支持按本地最新日期做增量更新
-- 支持自动补齐中间缺口
-- 能区分 `updated`、`up_to_date`、`no_new_data`、`suspended`、`failed` 等同步结果
-- 会记录同步任务和明细，方便后续追踪和 agent 读取
+- `MySQL` 是主数据源
+- 日线同步、质量修复、股票查询、选股都围绕 MySQL 工作
+- Web 工作台已经可用，支持后台同步进度轮询
+- 历史本地日线 CSV 仓库已经移除，不再作为主数据链路
+- `data/cache/` 仍然保留为第三方接口缓存层
 
-### 2. Web 工作台
+当前已经落地的页面能力：
 
-当前 Web 页面已经包含：
+- 数据库概览
+- 同步到最新
+- 修复最近日线
+- 单股行情查询和 K 线展示
+- 日终选股
+- 研究助手对话框（依赖独立 `re_agent` 服务）
+- 最近任务和操作结果查看
 
-- 数据库概览：总行数、覆盖股票数、最新交易日、最近任务
-- 数据维护：导入本地日线库、增量同步日线
-- 股票行情：按代码或名称搜索股票，查看本地 MySQL 日 K 数据和 K 线图
-- 日终选股：保留当前简单策略作为研究入口
-- 选股结果：展示当次策略输出
+## 技术栈
 
-### 3. 策略研究
+- Python 3.14
+- FastAPI + Uvicorn
+- SQLAlchemy 2.0 + PyMySQL
+- pandas / numpy
+- 数据源路由：`mootdx` + 腾讯财经 + `baostock` + AKShare/Sina/Eastmoney 兜底与补充
 
-现有策略还比较轻量，主要用于验证数据链路和策略框架：
+依赖见 [requirements.txt](/Users/lilinxing/Codes/quant/requirements.txt:1)。
 
-- 支持按交易日选股
-- 支持 `close < MA120 * ratio`
-- 支持股息率过滤
-- 支持排除亏损股票
-- 支持输出股息率、`PE(TTM)`、总市值等字段
-- 支持简单日频回测
+## 数据链路
 
-后续策略模块可以继续扩展，但它不再是这个项目唯一的中心。行情、数据维护、研究任务和 agent 出口都会成为工作台的一部分。
+### 主数据源
 
-## 推荐架构方向
+- 股票基础信息：AKShare
+- 日线行情：`DailyBarRouter` 路由多源抓取
+- 停牌信息、交易日历、估值、分红等：通过 `MarketDataClient` 获取并缓存
 
-详细设计草案见 [docs/WORKBENCH_ARCHITECTURE.md](/Users/lilinxing/Codes/quant/docs/WORKBENCH_ARCHITECTURE.md)。
+### 当前日线口径
 
-核心思路：
+- `volume = 手`
+- `amount = 元`
+- `turnover = 百分数数值`
 
-- MySQL 是主数据源，Web/API 不再写 SQLite
-- 数据同步、行情查询、策略研究、agent 调用都通过服务层访问数据
-- 长耗时任务不要阻塞页面，后续应改成后台任务加状态轮询
-- agent 不直接随意写库，而是通过明确的工具接口、任务记录和审批边界工作
-- Web 是统一入口，但底层模块要保持边界清晰，避免所有逻辑堆在页面函数里
+### 存储层
 
-建议逐步拆成这些模块：
+- 主库存放在 MySQL
+- 第三方接口缓存存放在 `data/cache/`
+- 同步任务与明细记录在 `sync_runs` / `sync_run_items`
 
-- `quant_data`：数据源、同步、清洗、入库
-- `quant_market`：行情查询、K 线、指标、股票画像
-- `quant_strategy`：选股规则、组合构建、回测
-- `quant_tasks`：后台任务、任务状态、运行日志
-- `quant_agent`：投资助手 agent 的工具注册、上下文构建和执行审计
-- `quant_web`：Web 页面和 API 编排
+## 快速开始
 
-当前代码还没有完全拆成这些包，可以按功能增长逐步演进，不需要一次性大重构。
-
-## 安装
+### 1. 安装依赖
 
 ```bash
 python3 -m venv .venv
@@ -75,96 +70,120 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## MySQL 配置
-
-Web 服务需要 MySQL 连接串：
+### 2. 配置 MySQL
 
 ```bash
 export QUANT_DATABASE_URL='mysql+pymysql://root:1234@127.0.0.1:3306/quant?charset=utf8mb4'
 ```
 
-如果需要初始化 MySQL schema：
+初始化 schema：
 
 ```bash
 /usr/local/mysql/bin/mysql -uroot -p1234 --local-infile=1 < sql/schema_mysql.sql
 ```
 
-如果需要从现有本地 CSV 导入 MySQL：
+如果库里还没有基础股票表、交易日历、分红汇总、停牌快照，可以用缓存摘要补一次：
 
 ```bash
 python3 scripts/import_mysql_data.py --password 1234
 ```
 
+### 3. 启动 Web 工作台
+
+```bash
+python3 main.py --mode serve --host 127.0.0.1 --port 8000
+```
+
+打开 [http://127.0.0.1:8000](http://127.0.0.1:8000)。
+
+如果你本地已经装好了依赖，也可以直接运行：
+
+```bash
+./scripts/start_quant.command
+```
+
 ## 常用命令
 
-### 启动 Web 工作台
-
-```bash
-export QUANT_DATABASE_URL='mysql+pymysql://root:1234@127.0.0.1:3306/quant?charset=utf8mb4'
-
-python3 main.py \
-  --mode serve \
-  --host 127.0.0.1 \
-  --port 8000
-```
-
-然后打开 [http://127.0.0.1:8000](http://127.0.0.1:8000)。
-
-### 首次全量下载历史日线
-
-```bash
-python3 main.py \
-  --mode download-daily \
-  --start 2015-01-01 \
-  --end 2026-04-09 \
-  --workers 8 \
-  --skip-existing-store
-```
-
-### 每日增量更新
+### 增量同步到最新
 
 ```bash
 python3 main.py \
   --mode update-daily \
-  --end 2026-04-09 \
+  --end 2026-05-18 \
   --workers 8
 ```
 
-日常增量同步由数据库状态驱动：系统会读取每只股票在 MySQL 中的最新日线日期，已有数据的股票只从 `latest_db_date + 1` 补到目标日期；只有空库或新股票才使用 `--start` 作为历史回填起点。Web 工作台的“同步到最新”不再要求填写起始日期。
+说明：
 
-日线同步现在通过 provider/router 层选择数据源，默认优先使用 `mootdx` 通达信接口获取前复权日线，第二优先级使用腾讯财经，第三优先级使用 `baostock`，新浪仅作为兜底源；东财行情源不进入默认同步链路。同步会把真实 `data_source` 和 `quality_flags` 写入 MySQL，便于排查上游缺成交量、缺成交额、字段变化或局部断供。
+- 系统会按 MySQL 中每只股票的最新日期决定补数起点
+- 已有历史数据的股票会从 `latest_db_date + 1` 开始补
+- 空库或新股票才会回退到 `--start` 指定的起点
 
-当前统一口径为：`volume=手`、`amount=元`、`turnover=百分数数值`。`mootdx` 负责主行情，`baostock` 负责历史换手率修复，腾讯直连 quote 负责最近交易日的实时换手率和成交额补充。
+`download-daily` 目前仍然保留，但实现上和 `update-daily` 走的是同一条链路，主要是兼容旧用法。
 
-### 日线质量修复
+### 首次大范围回填
+
+```bash
+python3 main.py \
+  --mode update-daily \
+  --start 2015-01-01 \
+  --end 2026-05-18 \
+  --workers 8
+```
+
+### 修复最近异常日线
 
 ```bash
 python3 main.py \
   --mode repair-daily-quality \
-  --start 2020-01-01 \
-  --end 2026-04-09 \
+  --start 2026-05-01 \
+  --end 2026-05-18 \
   --workers 4
 ```
 
-该模式会扫描 MySQL 中 OHLC 缺失/异常、成交量缺失、成交额缺失的日线记录，按股票生成修复队列，并通过同一套 provider 重新拉取后覆盖修复。建议在每日增量更新后或次日盘前运行一次。
+这条链路会扫描 MySQL 中 OHLC、成交量、成交额等异常记录，重新抓取并覆盖。
 
-如果历史库存在成交量单位混乱、成交额异常或历史换手率缺失，可以使用 `scripts/repair_daily_units.py` 做一次系统性校准。脚本会用 `mootdx` 重拉前复权 OHLCV/成交额，用 `baostock` 补历史换手率，并在最新交易日可用时用腾讯实时 quote 补最近一日换手率。
+### 系统性修复历史单位问题
 
-Web 工作台还提供“修复最近日线”，默认扫描最近 10 个交易日附近的异常记录，适合修补最近几天上游延迟、缺成交量或接口短暂失败造成的坏数据。
+```bash
+python3 scripts/repair_daily_units.py \
+  --start 2010-01-01 \
+  --end 2026-05-18 \
+  --workers 1
+```
+
+这个脚本适合处理历史库里成交量、成交额、换手率单位不一致的问题。
 
 ### 日终选股
 
 ```bash
 python3 main.py \
   --mode screen \
-  --trade-date 2026-04-09 \
+  --trade-date 2026-05-18 \
   --price-ma-ratio 0.9 \
-  --min-dividend-yield 5 \
-  --max-stocks 0 \
-  --output data/screen_2026-04-09.csv
+  --min-dividend-yield 5
 ```
 
-### 简单回测
+当前选股逻辑基于：
+
+- `close < MA120 * ratio`
+- 最低股息率过滤
+- 非亏损过滤
+
+结果里会附带：
+
+- `dividend_yield`
+- `pe_ttm`
+- `market_cap`
+- 数据来源说明
+
+说明：
+
+- 这里的股息率优先取直接股息率数据
+- 拿不到时会退回到历史分红汇总，用“年均股息 / 最新收盘价”做估算
+- 所以结果里可能同时存在“直连股息率”和“估算股息率”
+
+### 回测
 
 ```bash
 python3 main.py \
@@ -176,14 +195,32 @@ python3 main.py \
   --max-stocks 100
 ```
 
-## 当前边界
+注意：
 
-- 当前数据频率以日线为主，还不是实时行情系统
-- 数据源主要依赖 `AKShare`，第三方接口偶尔会失败
-- 北交所部分股票接口稳定性相对差一些
-- 选股和回测仍是研究原型，不是实盘交易系统
-- Web 任务目前还有同步请求，后续应改成后台任务状态模型
-- agent 模块尚未接入，现阶段先保留清晰的 API 和任务记录边界
+- 回测当前主要通过 `MarketDataClient` 直接取数并使用缓存
+- 它更像策略原型验证，不是严格的生产级回测框架
+
+## Web 页面说明
+
+当前页面包含这些区域：
+
+- 数据库概览：总行数、覆盖股票数、最新交易日、最近任务
+- 增量同步日线：后台启动，前端轮询进度
+- 修复最近日线：面向近期异常记录
+- 日终选股：执行当前策略并展示结果
+- 股票行情：按代码或名称查看本地 MySQL K 线
+- 研究助手：通过 `/api/re-agent/chat` 代理外部 `re_agent`
+
+## `re_agent` 说明
+
+Web 页面里的“研究助手”不是本项目内部实现的 LLM，而是代理一个独立服务。
+
+默认配置：
+
+- `RE_AGENT_BASE_URL=http://127.0.0.1:8010`
+- `RE_AGENT_CHAT_PATH=/research/single-symbol`
+
+如果本地没有启动 `re_agent`，不影响行情、同步、选股这些核心功能，只是助手面板不可用。
 
 ## 目录结构
 
@@ -191,31 +228,55 @@ python3 main.py \
 quant/
 ├── data/
 │   ├── cache/
-│   ├── daily_store/
-│   └── reports/
+│   └── ...
 ├── docs/
 │   └── WORKBENCH_ARCHITECTURE.md
 ├── main.py
 ├── requirements.txt
 ├── scripts/
-│   └── import_mysql_data.py
+│   ├── import_mysql_data.py
+│   ├── repair_daily_units.py
+│   └── start_quant.command
 ├── sql/
 │   └── schema_mysql.sql
 └── src/
     ├── quant_backtest/
-    │   ├── backtest.py
-    │   ├── data.py
-    │   └── strategy.py
+    ├── quant_data/
     └── quant_web/
-        ├── app.py
-        ├── db.py
-        └── service.py
 ```
 
-## 下一步优先级
+## 主要模块
 
-- 把 Web 的长耗时任务改成后台任务和状态轮询
-- 增加自选股、关注列表和股票笔记
-- 给行情页增加均线、成交量、复权切换和区间选择
-- 把选股策略抽象成可配置规则
-- 为投资助手 agent 设计工具调用协议、权限边界和运行日志
+- [main.py](/Users/lilinxing/Codes/quant/main.py:1)
+  CLI 入口，支持 `serve / update-daily / download-daily / repair-daily-quality / screen / backtest`
+
+- [src/quant_web/app.py](/Users/lilinxing/Codes/quant/src/quant_web/app.py:1)
+  FastAPI 路由和内嵌单页前端
+
+- [src/quant_web/service.py](/Users/lilinxing/Codes/quant/src/quant_web/service.py:1)
+  同步、修复、股票查询、选股等服务层逻辑
+
+- [src/quant_web/db.py](/Users/lilinxing/Codes/quant/src/quant_web/db.py:1)
+  MySQL ORM 模型和数据库初始化
+
+- [src/quant_data/router.py](/Users/lilinxing/Codes/quant/src/quant_data/router.py:1)
+  多数据源路由
+
+- [src/quant_backtest/data.py](/Users/lilinxing/Codes/quant/src/quant_backtest/data.py:1)
+  缓存、分红、估值、交易日历等数据访问封装
+
+## 当前边界
+
+- 目前仍以日线为主，不是实时行情系统
+- 第三方数据源会波动，偶尔会出现缺字段、缺成交量、局部断供
+- 北交所股票的稳定性通常比沪深主板差一些
+- `daily_bar_indicators` 表仍存在，但当前主同步链路不会自动刷新均线表
+- 选股和回测仍属于研究原型，不应直接当作交易建议
+- `re_agent` 是外部依赖，不保证在所有环境默认可用
+
+## 下一步更值得做的事
+
+- 在同步或修复后自动刷新 `daily_bar_indicators`
+- 给股息率补一张独立因子表，而不是只在选股时临时计算
+- 把选股和修复任务也统一成更完整的后台任务体系
+- 增加自选股、笔记和股票观察流

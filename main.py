@@ -30,13 +30,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-dividend-filter", action="store_true")
     parser.add_argument("--allow-loss-making", action="store_true")
     parser.add_argument("--cache-daily-bars", action="store_true", help="Persist daily bars in screen mode")
-    parser.add_argument("--disable-local-daily-store", action="store_true", help="Deprecated; screen mode now reads from MySQL")
-    parser.add_argument(
-        "--skip-existing-store",
-        action="store_true",
-        help="Deprecated; daily sync now uses MySQL as the primary store",
-    )
-    parser.add_argument("--retry-failures-only", action="store_true", help="For download/update daily modes, retry only stocks recorded in the last failure manifest")
     parser.add_argument("--no-cache", action="store_true")
     parser.add_argument("--output", help="Optional output CSV path for screen results")
     parser.add_argument(

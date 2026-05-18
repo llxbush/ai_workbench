@@ -1,13 +1,10 @@
 from __future__ import annotations
 
 import os
-import sys
 import time
 import threading
 from dataclasses import dataclass
-from datetime import timedelta
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Iterable
 
 import pandas as pd
@@ -18,6 +15,7 @@ from src.quant_data.providers.baostock_daily import BaostockDailyBarProvider
 from src.quant_data.providers.daily_bars import (
     AkshareSinaDailyBarProvider,
     AkshareTencentDailyBarProvider,
+    EastmoneyDirectDailyBarProvider,
     MootdxDailyBarProvider,
 )
 from src.quant_data.router import DailyBarRouter
@@ -65,18 +63,16 @@ class MarketDataClient:
         (self.cache_dir / "dividend").mkdir(parents=True, exist_ok=True)
         (self.cache_dir / "valuation").mkdir(parents=True, exist_ok=True)
         (self.cache_dir / "summary").mkdir(parents=True, exist_ok=True)
-        (self.data_dir / "daily_store").mkdir(parents=True, exist_ok=True)
-        (self.data_dir / "reports").mkdir(parents=True, exist_ok=True)
         self.daily_bar_router = DailyBarRouter(
             providers=[
+                BaostockDailyBarProvider(),
                 MootdxDailyBarProvider(),
                 AkshareTencentDailyBarProvider(ak=ak),
-                BaostockDailyBarProvider(),
                 AkshareSinaDailyBarProvider(ak=ak, lock=SINA_DAILY_LOCK),
+                EastmoneyDirectDailyBarProvider(),
             ],
             min_interval_by_source={
                 "tencent_akshare": 0.25,
-                "baostock": 0.2,
                 "sina_akshare": 0.4,
             },
         )
@@ -349,356 +345,6 @@ class MarketDataClient:
             df["turnover"] = pd.NA
         return df[["date", "open", "close", "high", "low", "volume", "amount", "turnover"]]
 
-    def get_local_daily_store(self, symbol: str, adjust: str = "qfq") -> pd.DataFrame:
-        store_file = self._daily_store_file(symbol=symbol, adjust=adjust)
-        if not store_file.exists():
-            return pd.DataFrame(columns=["date", "open", "close", "high", "low", "volume"])
-        try:
-            cached = pd.read_csv(store_file, parse_dates=["date"])
-        except Exception:
-            self._cleanup_invalid_store_file(store_file)
-            return pd.DataFrame(columns=["date", "open", "close", "high", "low", "volume"])
-        return cached.sort_values("date").reset_index(drop=True)
-
-    def get_bars_from_store(
-        self,
-        symbol: str,
-        start_date: str,
-        end_date: str,
-        adjust: str = "qfq",
-    ) -> pd.DataFrame:
-        df = self.get_local_daily_store(symbol=symbol, adjust=adjust)
-        if df.empty:
-            return df
-        start_ts = pd.Timestamp(start_date)
-        end_ts = pd.Timestamp(end_date)
-        return df[(df["date"] >= start_ts) & (df["date"] <= end_ts)].sort_values("date").reset_index(drop=True)
-
-    def update_local_daily_store(
-        self,
-        symbol: str,
-        start_date: str,
-        end_date: str,
-        adjust: str = "qfq",
-    ) -> dict:
-        existing = self.get_local_daily_store(symbol=symbol, adjust=adjust)
-        end_ts = pd.Timestamp(end_date)
-        fetch_start = pd.Timestamp(start_date)
-
-        if not existing.empty:
-            latest_local = pd.Timestamp(existing["date"].max())
-            if latest_local >= end_ts:
-                filtered = existing[existing["date"] <= end_ts].sort_values("date").reset_index(drop=True)
-                return {
-                    "symbol": symbol,
-                    "status": "up_to_date",
-                    "rows_added": 0,
-                    "total_rows": int(len(filtered)),
-                    "latest_date": latest_local.strftime("%Y-%m-%d"),
-                }
-            fetch_start = latest_local + timedelta(days=1)
-
-        try:
-            new_df = self.get_daily_bars(
-                symbol=symbol,
-                start_date=fetch_start.strftime("%Y-%m-%d"),
-                end_date=end_date,
-                adjust=adjust,
-                persist_cache=False,
-                raise_on_error=True,
-            )
-        except Exception as exc:
-            suspended_info = self.get_suspension_info(symbol=symbol, date=end_date)
-            if suspended_info is not None:
-                return self._build_suspended_result(
-                    symbol=symbol,
-                    existing=existing,
-                    suspended_info=suspended_info,
-                )
-            raise exc
-
-        if new_df.empty:
-            suspended_info = self.get_suspension_info(symbol=symbol, date=end_date)
-            if suspended_info is not None:
-                return self._build_suspended_result(
-                    symbol=symbol,
-                    existing=existing,
-                    suspended_info=suspended_info,
-                )
-            return {
-                "symbol": symbol,
-                "status": "no_new_data" if not existing.empty else "failed",
-                "rows_added": 0,
-                "total_rows": int(len(existing)),
-                "latest_date": existing["date"].max().strftime("%Y-%m-%d") if not existing.empty else "",
-                "suspension_reason": "",
-                "expected_resume_date": "",
-            }
-
-        merged = pd.concat([existing, new_df], ignore_index=True)
-        merged = merged.drop_duplicates(subset=["date"], keep="last").sort_values("date").reset_index(drop=True)
-        merged.to_csv(self._daily_store_file(symbol=symbol, adjust=adjust), index=False)
-        latest_date = pd.Timestamp(merged["date"].max()).strftime("%Y-%m-%d")
-        return {
-            "symbol": symbol,
-            "status": "updated" if not existing.empty else "created",
-            "rows_added": int(len(merged) - len(existing)),
-            "total_rows": int(len(merged)),
-            "latest_date": latest_date,
-            "suspension_reason": "",
-            "expected_resume_date": "",
-        }
-        
-    def safe_update_local_daily_store(
-        self,
-        symbol: str,
-        start_date: str,
-        end_date: str,
-        adjust: str = "qfq",
-    ) -> dict:
-        try:
-            result = self.update_local_daily_store(
-                symbol=symbol,
-                start_date=start_date,
-                end_date=end_date,
-                adjust=adjust,
-            )
-            result["error"] = ""
-            return result
-        except Exception as exc:
-            return {
-                "symbol": symbol,
-                "status": "failed",
-                "rows_added": 0,
-                "total_rows": 0,
-                "latest_date": "",
-                "error": f"{type(exc).__name__}: {exc}",
-            }
-
-    def bulk_update_local_daily_store(
-        self,
-        start_date: str,
-        end_date: str,
-        max_stocks: int = 0,
-        adjust: str = "qfq",
-        workers: int = 1,
-        show_progress: bool = True,
-        skip_existing_files: bool = False,
-        retry_failures_only: bool = False,
-        failure_manifest_name: str = "daily_store_failures.csv",
-    ) -> pd.DataFrame:
-        end_date = self.resolve_effective_end_date(end_date)
-        stock_list = self.build_daily_store_worklist(
-            start_date=start_date,
-            end_date=end_date,
-            max_stocks=max_stocks,
-            adjust=adjust,
-            skip_existing_files=skip_existing_files,
-            retry_failures_only=retry_failures_only,
-            failure_manifest_name=failure_manifest_name,
-        )
-
-        rows: list[dict] = []
-        total = len(stock_list)
-        completed = 0
-        success = 0
-        failed = 0
-
-        def emit_progress() -> None:
-            if not show_progress or total == 0:
-                return
-            message = (
-                f"\r进度: {completed}/{total} | 成功: {success} | 失败/无数据: {failed}"
-            )
-            print(message, end="", file=sys.stderr, flush=True)
-
-        if workers <= 1:
-            for _, row in stock_list.iterrows():
-                result = self.safe_update_local_daily_store(
-                    symbol=row["symbol"],
-                    start_date=row.get("fetch_start", start_date),
-                    end_date=end_date,
-                    adjust=adjust,
-                )
-                result["name"] = row["name"]
-                result["planned_start_date"] = row.get("fetch_start", start_date)
-                result["download_reason"] = row.get("download_reason", "")
-                rows.append(result)
-                completed += 1
-                if result["status"] in {"created", "updated", "up_to_date", "no_new_data", "suspended"}:
-                    success += 1
-                else:
-                    failed += 1
-                emit_progress()
-            if show_progress and total > 0:
-                print(file=sys.stderr)
-            result_df = pd.DataFrame(rows)
-            self.write_failure_manifest(
-                result_df=result_df,
-                manifest_name=failure_manifest_name,
-            )
-            return result_df
-
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            future_map = {
-                executor.submit(
-                    self.safe_update_local_daily_store,
-                    row["symbol"],
-                    row.get("fetch_start", start_date),
-                    end_date,
-                    adjust,
-                ): {
-                    "name": row["name"],
-                    "fetch_start": row.get("fetch_start", start_date),
-                    "download_reason": row.get("download_reason", ""),
-                }
-                for _, row in stock_list.iterrows()
-            }
-            for future in as_completed(future_map):
-                result = future.result()
-                result["name"] = future_map[future]["name"]
-                result["planned_start_date"] = future_map[future]["fetch_start"]
-                result["download_reason"] = future_map[future]["download_reason"]
-                rows.append(result)
-                completed += 1
-                if result["status"] in {"created", "updated", "up_to_date", "no_new_data", "suspended"}:
-                    success += 1
-                else:
-                    failed += 1
-                emit_progress()
-        if show_progress and total > 0:
-            print(file=sys.stderr)
-        result_df = pd.DataFrame(rows)
-        self.write_failure_manifest(
-            result_df=result_df,
-            manifest_name=failure_manifest_name,
-        )
-        return result_df
-
-    def build_daily_store_worklist(
-        self,
-        start_date: str,
-        end_date: str,
-        max_stocks: int = 0,
-        adjust: str = "qfq",
-        skip_existing_files: bool = False,
-        retry_failures_only: bool = False,
-        failure_manifest_name: str = "daily_store_failures.csv",
-    ) -> pd.DataFrame:
-        if retry_failures_only:
-            retry_df = self.read_failure_manifest(manifest_name=failure_manifest_name)
-            if retry_df.empty:
-                return pd.DataFrame(columns=["symbol", "name", "fetch_start", "latest_local_date"])
-            stock_list = retry_df[["symbol", "name"]].drop_duplicates().reset_index(drop=True)
-        else:
-            stock_list = self.get_stock_list()
-
-        end_ts = pd.Timestamp(end_date)
-        rows: list[dict] = []
-        for _, row in stock_list.iterrows():
-            symbol = str(row["symbol"]).zfill(6)
-            name = row["name"]
-            store_state = self.get_local_daily_store_state(
-                symbol=symbol,
-                start_date=start_date,
-                end_date=end_ts,
-                adjust=adjust,
-            )
-            latest_local_date = store_state["latest_local_date"]
-            if not store_state["needs_download"]:
-                continue
-            if skip_existing_files and store_state["has_valid_store"]:
-                continue
-
-            rows.append(
-                {
-                    "symbol": symbol,
-                    "name": name,
-                    "fetch_start": store_state["fetch_start"],
-                    "latest_local_date": latest_local_date.strftime("%Y-%m-%d") if latest_local_date is not None else "",
-                    "download_reason": store_state["download_reason"],
-                    "has_valid_store": store_state["has_valid_store"],
-                }
-            )
-
-        worklist = pd.DataFrame(rows)
-        if not worklist.empty:
-            worklist["latest_local_date_sort"] = pd.to_datetime(
-                worklist["latest_local_date"],
-                errors="coerce",
-            )
-            worklist["download_reason_order"] = worklist["download_reason"].map(
-                {"missing_store": 0, "stale_store": 1}
-            ).fillna(9)
-            worklist = worklist.sort_values(
-                by=["download_reason_order", "latest_local_date_sort", "symbol"],
-                kind="stable",
-            ).drop(columns=["latest_local_date_sort", "download_reason_order"])
-        if max_stocks and max_stocks > 0:
-            worklist = worklist.head(max_stocks)
-        return worklist.reset_index(drop=True)
-
-    def get_local_latest_date(self, symbol: str, adjust: str = "qfq") -> pd.Timestamp | None:
-        store_file = self._daily_store_file(symbol=symbol, adjust=adjust)
-        if not store_file.exists():
-            return None
-        try:
-            df = pd.read_csv(store_file, usecols=["date"], parse_dates=["date"])
-        except Exception:
-            self._cleanup_invalid_store_file(store_file)
-            return None
-        if df.empty:
-            return None
-        latest_date = pd.to_datetime(df["date"], errors="coerce").max()
-        return None if pd.isna(latest_date) else pd.Timestamp(latest_date)
-
-    def get_local_daily_store_state(
-        self,
-        symbol: str,
-        start_date: str,
-        end_date: pd.Timestamp,
-        adjust: str = "qfq",
-    ) -> dict:
-        latest_local_date = self.get_local_latest_date(symbol=symbol, adjust=adjust)
-        has_valid_store = latest_local_date is not None
-
-        if latest_local_date is None:
-            return {
-                "has_valid_store": has_valid_store,
-                "latest_local_date": None,
-                "needs_download": True,
-                "fetch_start": start_date,
-                "download_reason": "missing_store",
-            }
-
-        if latest_local_date >= end_date:
-            return {
-                "has_valid_store": has_valid_store,
-                "latest_local_date": latest_local_date,
-                "needs_download": False,
-                "fetch_start": "",
-                "download_reason": "up_to_date",
-            }
-
-        return {
-            "has_valid_store": has_valid_store,
-            "latest_local_date": latest_local_date,
-            "needs_download": True,
-            "fetch_start": (latest_local_date + timedelta(days=1)).strftime("%Y-%m-%d"),
-            "download_reason": "stale_store",
-        }
-
-    def write_failure_manifest(self, result_df: pd.DataFrame, manifest_name: str) -> None:
-        if result_df.empty:
-            return
-        manifest_path = self.data_dir / "reports" / manifest_name
-        failed_df = result_df[result_df["status"] == "failed"].copy()
-        if failed_df.empty:
-            if manifest_path.exists():
-                manifest_path.unlink()
-            return
-        failed_df.to_csv(manifest_path, index=False)
-
     def get_suspension_info(self, symbol: str, date: str) -> dict | None:
         tfp_df = self.get_suspension_snapshot(date=date)
         if tfp_df.empty:
@@ -757,12 +403,6 @@ class MarketDataClient:
             "suspension_reason": suspended_info.get("reason", ""),
             "expected_resume_date": suspended_info.get("expected_resume_date", ""),
         }
-
-    def read_failure_manifest(self, manifest_name: str) -> pd.DataFrame:
-        manifest_path = self.data_dir / "reports" / manifest_name
-        if not manifest_path.exists():
-            return pd.DataFrame()
-        return pd.read_csv(manifest_path)
 
     def resolve_effective_end_date(self, end_date: str) -> str:
         today = pd.Timestamp.now().normalize()
@@ -1093,14 +733,3 @@ class MarketDataClient:
         if symbol.startswith(("5", "6", "9")):
             return f"sh{symbol}"
         return f"sz{symbol}"
-
-    def _daily_store_file(self, symbol: str, adjust: str = "qfq") -> Path:
-        return self.data_dir / "daily_store" / f"{symbol}_{adjust}.csv"
-
-    @staticmethod
-    def _cleanup_invalid_store_file(store_file: Path) -> None:
-        try:
-            if store_file.exists():
-                store_file.unlink()
-        except OSError:
-            return
